@@ -117,7 +117,8 @@ export const UserWalletsLedgerModule: React.FC<UserWalletsLedgerModuleProps> = (
         (w.userEmail || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
         w.userId.toLowerCase().includes(searchQuery.toLowerCase());
       const matchesRole = roleFilter === 'all' || w.userRole === roleFilter;
-      const matchesStatus = statusFilter === 'all' || (statusFilter === 'active' ? !w.isFrozen : w.isFrozen);
+      const isFrozen = w.status === 'frozen';
+      const matchesStatus = statusFilter === 'all' || (statusFilter === 'active' ? !isFrozen : isFrozen);
       return matchesSearch && matchesRole && matchesStatus;
     });
   }, [wallets, searchQuery, roleFilter, statusFilter]);
@@ -211,7 +212,7 @@ export const UserWalletsLedgerModule: React.FC<UserWalletsLedgerModuleProps> = (
 
   const handleFreezeToggle = async () => {
     if (!selectedWalletId || !walletDetail) return;
-    const isFrozen = walletDetail.wallet.isFrozen;
+    const isFrozen = walletDetail.wallet.status === 'frozen';
     setIsSubmittingFreeze(true);
     try {
       const endpoint = isFrozen 
@@ -237,6 +238,7 @@ export const UserWalletsLedgerModule: React.FC<UserWalletsLedgerModuleProps> = (
 
   if (selectedWalletId && walletDetail) {
     const w = walletDetail.wallet;
+    const isFrozen = w.status === 'frozen';
     const userTxns = walletDetail.transactions || [];
     return (
       <div className="space-y-6 font-sans">
@@ -249,9 +251,9 @@ export const UserWalletsLedgerModule: React.FC<UserWalletsLedgerModuleProps> = (
             <ChevronLeft className="w-4 h-4" /> Back to Wallets
           </button>
           <div className="flex items-center gap-2">
-            {w.isFrozen ? (
+            {isFrozen ? (
               <span className="px-3 py-1 rounded-full text-xs font-bold bg-rose-50 text-rose-700 border border-rose-200 flex items-center gap-1.5">
-                <Lock className="w-3.5 h-3.5" /> Frozen ({w.freezeReason || 'Under Review'})
+                <Lock className="w-3.5 h-3.5" /> Frozen ({w.restrictionReason || 'Under Review'})
               </span>
             ) : (
               <span className="px-3 py-1 rounded-full text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center gap-1.5">
@@ -295,10 +297,10 @@ export const UserWalletsLedgerModule: React.FC<UserWalletsLedgerModuleProps> = (
             </button>
             <button
               onClick={() => setIsFreezeOpen(true)}
-              className={`inline-flex items-center gap-1.5 font-bold px-3.5 py-2 rounded-xl text-xs shadow-xs transition border ${w.isFrozen ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100' : 'bg-rose-50 text-rose-700 border-rose-200 hover:bg-rose-100'}`}
+              className={`inline-flex items-center gap-1.5 font-bold px-3.5 py-2 rounded-xl text-xs shadow-xs transition border ${isFrozen ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100' : 'bg-rose-50 text-rose-700 border-rose-200 hover:bg-rose-100'}`}
             >
-              {w.isFrozen ? <Sun className="w-3.5 h-3.5" /> : <Snowflake className="w-3.5 h-3.5" />}
-              {w.isFrozen ? 'UNFREEZE WALLET' : 'FREEZE WALLET'}
+              {isFrozen ? <Sun className="w-3.5 h-3.5" /> : <Snowflake className="w-3.5 h-3.5" />}
+              {isFrozen ? 'UNFREEZE WALLET' : 'FREEZE WALLET'}
             </button>
           </div>
         </div>
@@ -487,12 +489,12 @@ export const UserWalletsLedgerModule: React.FC<UserWalletsLedgerModuleProps> = (
           <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
             <div className="bg-white border border-slate-200 rounded-3xl p-6 max-w-md w-full shadow-2xl space-y-5">
               <div className="flex items-center justify-between">
-                <h3 className="text-xl font-bold text-slate-900">{w.isFrozen ? 'Unfreeze Wallet' : 'Freeze Wallet'}</h3>
+                <h3 className="text-xl font-bold text-slate-900">{isFrozen ? 'Unfreeze Wallet' : 'Freeze Wallet'}</h3>
                 <button onClick={() => setIsFreezeOpen(false)} className="text-slate-400 hover:text-slate-600"><X className="w-5 h-5" /></button>
               </div>
               <div className="space-y-4">
                 <p className="text-xs text-slate-600">
-                  {w.isFrozen ? 'This restores normal wallet activity and unlocks outbound withdrawals.' : 'Reason for freezing this wallet account:'}
+                  {isFrozen ? 'This restores normal wallet activity and unlocks outbound withdrawals.' : 'Reason for freezing this wallet account:'}
                 </p>
                 <div>
                   <label className="block text-xs font-bold text-slate-600 mb-1">Reason</label>
@@ -504,8 +506,8 @@ export const UserWalletsLedgerModule: React.FC<UserWalletsLedgerModuleProps> = (
                 </div>
                 <div className="flex justify-end gap-3 pt-2">
                   <button type="button" onClick={() => setIsFreezeOpen(false)} className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-xl text-sm transition">Cancel</button>
-                  <button type="button" disabled={isSubmittingFreeze} onClick={handleFreezeToggle} className={`px-5 py-2 text-white font-bold rounded-xl text-sm shadow-xs transition disabled:opacity-50 ${w.isFrozen ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-rose-600 hover:bg-rose-700'}`}>
-                    {isSubmittingFreeze ? 'Processing...' : (w.isFrozen ? 'Unfreeze' : 'Freeze')}
+                  <button type="button" disabled={isSubmittingFreeze} onClick={handleFreezeToggle} className={`px-5 py-2 text-white font-bold rounded-xl text-sm shadow-xs transition disabled:opacity-50 ${isFrozen ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-rose-600 hover:bg-rose-700'}`}>
+                    {isSubmittingFreeze ? 'Processing...' : (isFrozen ? 'Unfreeze' : 'Freeze')}
                   </button>
                 </div>
               </div>
@@ -624,6 +626,7 @@ export const UserWalletsLedgerModule: React.FC<UserWalletsLedgerModuleProps> = (
                   const available = Number(w.availableBalance || 0);
                   const escrow = Number(w.fundsOnHold || 0);
                   const total = available + escrow;
+                  const isFrozen = w.status === 'frozen';
                   return (
                     <tr key={w.userId} className="hover:bg-slate-50/60 transition">
                       <td className="py-3.5 px-4">
@@ -645,7 +648,7 @@ export const UserWalletsLedgerModule: React.FC<UserWalletsLedgerModuleProps> = (
                         ${total.toFixed(2)}
                       </td>
                       <td className="py-3.5 px-4">
-                        {!w.isFrozen ? (
+                        {!isFrozen ? (
                           <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 inline-flex items-center gap-1">
                             ● Active
                           </span>

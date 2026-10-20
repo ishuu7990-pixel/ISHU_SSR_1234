@@ -86,7 +86,7 @@ export function useWorkstreamRealtime({
               const isSame = (m: any) =>
                 m.id === incomingMsg.id ||
                 (clientMsgId && m.metadata?.clientMessageId === clientMsgId) ||
-                (singletonAction && m.type === 'system' && m.orderId === incomingMsg.orderId && m.metadata?.action === singletonAction);
+                (singletonAction && m.type === 'system' && m.orderId === incomingMsg.orderId && m.metadata?.action === incomingMsg.metadata?.action);
               const alreadyExists = prev.some(isSame);
               if (alreadyExists) {
                 // If it exists but was optimistic, update it with full server data

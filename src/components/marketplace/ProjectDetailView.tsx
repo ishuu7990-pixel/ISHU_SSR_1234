@@ -122,11 +122,7 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
 
   const resolveProposalWorkstreamId = (prop: Proposal): string | undefined => {
     if (prop.workstreamOrderId) return prop.workstreamOrderId;
-    const matchedOrder = orders.find(o =>
-      (o.proposalId && o.proposalId === prop.id) ||
-      (o.projectId === project.id && o.sellerId === prop.freelancerId && o.status !== 'cancelled')
-    );
-    return matchedOrder?.id;
+    return orders.find(o => o.proposalId && o.proposalId === prop.id)?.id;
   };
 
   const handleProposalDecision = async (prop: Proposal, action: 'accept' | 'decline') => {

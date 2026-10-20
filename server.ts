@@ -34,7 +34,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '10mb' }));
+app.use((req, res, next) => {
+  if (req.path === '/api/payments/webhook' && req.method === 'POST') {
+    return next();
+  }
+  return express.json({ limit: '10mb' })(req, res, next);
+});
 
 // ==========================================
 // PRODUCTION / DEVELOPMENT SECURITY BOUNDARY
@@ -280,9 +285,9 @@ app.post('/api/auth/signup', async (req, res) => {
       name: (typeof name === 'string' && name.trim() ? name.trim().slice(0, 80) : normalizedEmail.split('@')[0]),
       email: normalizedEmail,
       mobile: mobile.trim(),
-      role: isFirstUser ? 'super_admin' : 'user',
+      role: 'user',
       avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=400&h=400&fit=crop',
-      title: isFirstUser ? 'Super Administrator' : 'Freelancer / Member',
+      title: 'Freelancer / Member',
       rating: 0,
       reviewsCount: 0,
       hourlyRate: 50,
@@ -1158,6 +1163,7 @@ interface Order {
   sellerId: string;
   amount: number;
   status: 'payment_pending' | 'funded_in_escrow' | 'in_progress' | 'delivered' | 'completed' | 'disputed' | 'revision' | 'cancelled' | 'draft_review' | 'work_in_progress';
+  previousStatus?: string;
   createdAt: string;
   completedAt?: string;
   dueDate: string;
@@ -1659,6 +1665,16 @@ function acquireOrderLock(orderId: string) {
   orderStateLocks.add(orderId);
 }
 
+function tryAcquireOrderLock(orderId: string, res: any): boolean {
+  try {
+    acquireOrderLock(orderId);
+    return true;
+  } catch (err: any) {
+    res.status(409).json({ error: err.message });
+    return false;
+  }
+}
+
 function releaseOrderLock(orderId: string) {
   orderStateLocks.delete(orderId);
 }
@@ -1741,10 +1757,12 @@ function loadInitialOrdersAndMessages() {
       if (escrow) {
         console.log(`[Recovery] Order ${order.id} was in payment_pending but ledger has escrow. Recovering to funded_in_escrow.`);
         order.status = 'funded_in_escrow';
+        order.previousStatus = undefined;
         recoveryNeeded = true;
       } else {
-        console.log(`[Recovery] Order ${order.id} was in payment_pending but ledger has no escrow. Marking as cancelled (funding likely never happened).`);
-        order.status = 'cancelled';
+        console.log(`[Recovery] Order ${order.id} was in payment_pending but ledger has no escrow. Recovering to ${order.previousStatus || 'cancelled'}.`);
+        order.status = (order.previousStatus as any) || 'cancelled';
+        order.previousStatus = undefined;
         recoveryNeeded = true;
       }
     }
@@ -2699,7 +2717,7 @@ app.post('/api/orders/:id/admin-notes', requireAdmin, async (req, res) => {
 // Upload Deliverable Override / File
 app.post('/api/orders/:id/deliverable', requireAuth, async (req, res) => {
   const orderId = req.params.id;
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const order = orderIndex.get(orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -2865,7 +2883,7 @@ app.post('/api/orders/:id/deliverable', requireAuth, async (req, res) => {
 // Request Revision on Deliverable
 app.post('/api/orders/:id/revision', requireAuth, async (req, res) => {
   const orderId = req.params.id;
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const order = orderIndex.get(orderId);
   if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -2920,7 +2938,7 @@ app.post('/api/orders/:id/revision', requireAuth, async (req, res) => {
 // Participant (Buyer or Seller) Dispute Creation Flow
 app.post('/api/orders/:id/dispute', requireAuth, (req, res) => {
   const orderId = req.params.id;
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const order = orderIndex.get(orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -3084,7 +3102,7 @@ app.post('/api/users/:id/flag', requireAdmin, (req, res) => {
 // Force Complete & Release Funds (admin only)
 app.post('/api/orders/:id/force-complete', requireAdmin, (req, res) => {
   const orderId = req.params.id;
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const order = orderIndex.get(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -3108,7 +3126,7 @@ app.post('/api/orders/:id/force-complete', requireAdmin, (req, res) => {
 // Force Cancel & Refund Buyer (admin only). A partial refund refunds that amount and releases the rest to the seller.
 app.post('/api/orders/:id/force-cancel', requireAdmin, (req, res) => {
   const orderId = req.params.id;
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const order = orderIndex.get(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -3528,7 +3546,9 @@ app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), (re
   hmac.update(req.body);
   const calculatedSignature = hmac.digest('hex');
 
-  if (calculatedSignature !== signature) {
+  const sigBuf = Buffer.from(signature);
+  const expBuf = Buffer.from(calculatedSignature);
+  if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) {
     return res.status(403).json({ error: 'Unauthorized: Invalid signature' });
   }
 
@@ -3598,7 +3618,7 @@ function validateOrderReleasePreconditions(order: Order, isAdmin = false, isInvo
 app.post('/api/payments/escrow/release', requireAuth, (req, res) => {
   const { orderId } = req.body;
   if (!orderId) return res.status(400).json({ error: 'Order ID is required' });
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const userId = (req as any).authenticatedUserId;
     const caller = users.find(u => u.id === userId);
@@ -3695,7 +3715,7 @@ app.post('/api/payments/escrow/release', requireAuth, (req, res) => {
 app.post('/api/payments/escrow/refund', requireAuth, (req, res) => {
   const { orderId } = req.body;
   if (!orderId) return res.status(400).json({ error: 'Order ID is required' });
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const userId = (req as any).authenticatedUserId;
     const caller = users.find(u => u.id === userId);
@@ -3760,7 +3780,7 @@ app.post('/api/payments/escrow/refund', requireAuth, (req, res) => {
 app.post('/api/payments/escrow/deposit', requireAuth, rateLimit(20, 60_000), (req, res) => {
   const orderId = String(req.body?.orderId || '');
   if (!orderId) return res.status(400).json({ error: 'Order ID is required' });
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const authUserId = (req as any).authenticatedUserId;
     const caller = users.find(u => u.id === authUserId);
@@ -4227,7 +4247,7 @@ app.get('/api/admin/finance/escrow', requireAdmin, (req, res) => {
 
 app.post('/api/admin/finance/escrow/:orderId/release', requireAdmin, (req, res) => {
   const orderId = req.params.orderId;
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const order = orderIndex.get(orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -4256,7 +4276,7 @@ app.post('/api/admin/finance/escrow/:orderId/release', requireAdmin, (req, res) 
 
 app.post('/api/admin/finance/escrow/:orderId/refund', requireAdmin, (req, res) => {
   const orderId = req.params.orderId;
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const order = orderIndex.get(orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -6002,7 +6022,7 @@ async function processProposalAccept(req: any, res: any) {
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
   // Use a proposal-level lock to ensure atomicity for this specific proposal acceptance
-  acquireOrderLock(proposal.id);
+  if (!tryAcquireOrderLock(proposal.id, res)) return;
   try {
     const authUserId = (req as any).authenticatedUserId;
     const caller = (req as any).authenticatedUser || users.find((u: any) => u.id === authUserId);
@@ -6167,7 +6187,7 @@ async function processProposalDecline(req: any, res: any) {
   const proj = projects.find(p => p.id === proposal.projectId);
   if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-  acquireOrderLock(proposal.id);
+  if (!tryAcquireOrderLock(proposal.id, res)) return;
   try {
     const authUserId = (req as any).authenticatedUserId;
     const caller = (req as any).authenticatedUser || users.find((u: any) => u.id === authUserId);
@@ -6251,7 +6271,13 @@ app.post('/api/orders', requireAuth, rateLimit(30, 60_000), async (req, res) => 
     const projectOrderId = isProject ? id : undefined;
 
     let workspaceId = req.body?.workspaceId;
-    if (!workspaceId) {
+    if (workspaceId) {
+      const ws = workspaceService.getWorkspace(workspaceId);
+      if (!ws) return res.status(404).json({ error: 'Workspace not found.' });
+      if (ws.buyerId !== buyerId || ws.sellerId !== sellerId) {
+        return res.status(400).json({ error: 'The provided workspace does not match the buyer and seller of this order.' });
+      }
+    } else {
       const ws = workspaceService.createWorkspace({
         buyerId,
         sellerId,
@@ -6639,7 +6665,7 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
   const order = offer ? orders.find(o => o.id === offer.orderId) : undefined;
   if (!offer || !order) return res.status(404).json({ error: 'Not found' });
 
-  acquireOrderLock(order.id);
+  if (!tryAcquireOrderLock(order.id, res)) return;
   try {
     const caller = offerCaller(req);
     if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
@@ -6790,6 +6816,7 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
       }
       const newTitle = offer.kind === 'proposal' && (/^inquiry:/i.test(order.title) || !order.amount) ? offer.title : order.title;
       const prevStatus = order.status;
+      order.previousStatus = prevStatus;
       order.status = 'payment_pending';
       await saveOrdersToDisk(); // CRASH SAFE POINT: Order is durable as payment_pending before ledger funding
 
@@ -7028,15 +7055,27 @@ app.patch('/api/admin/users/:id', requireAdmin, (req, res) => {
     if (req.body.role === 'super_admin' && caller?.role !== 'super_admin') {
       return res.status(403).json({ error: 'Forbidden: Only super_admin can set super_admin role.' });
     }
+    if (!['buyer', 'freelancer', 'admin', 'super_admin', 'support', 'moderator'].includes(req.body.role)) {
+      return res.status(400).json({ error: 'Invalid role.' });
+    }
     u.role = req.body.role;
   }
   if (req.body.title !== undefined) u.title = escapeHtml(String(req.body.title));
   if (req.body.bio !== undefined) u.bio = escapeHtml(String(req.body.bio));
   if (req.body.skills !== undefined) u.skills = Array.isArray(req.body.skills) ? req.body.skills : req.body.skills.split(',').map((s: string) => s.trim()).filter(Boolean);
-  if (req.body.hourlyRate !== undefined) u.hourlyRate = Number(req.body.hourlyRate);
+  if (req.body.hourlyRate !== undefined) {
+      const hr = Number(req.body.hourlyRate);
+      if (!Number.isFinite(hr) || hr < 0) return res.status(400).json({ error: 'Invalid hourly rate.' });
+      u.hourlyRate = hr;
+  }
   // walletBalance is ledger-controlled and intentionally ignored here (use /api/admin/finance/adjustments)
   if (req.body.verified !== undefined) u.verified = Boolean(req.body.verified);
-  if (req.body.status !== undefined) u.status = req.body.status;
+  if (req.body.status !== undefined) {
+      if (!['active', 'frozen', 'restricted'].includes(req.body.status)) {
+         return res.status(400).json({ error: 'Invalid status.' });
+      }
+      u.status = req.body.status;
+  }
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -7205,7 +7244,11 @@ app.patch('/api/admin/disputes/:id/resolve', requireAdmin, (req, res) => {
     if (status.startsWith('resolved')) {
       if (!order) return res.status(404).json({ error: 'Order for this dispute not found' });
       lockedOrderId = order.id;
-      acquireOrderLock(lockedOrderId);
+      try {
+        acquireOrderLock(lockedOrderId);
+      } catch (err: any) {
+        return res.status(409).json({ error: err.message });
+      }
       if (status === 'resolved_release') releaseOrderFunds(order, adminActor(req), reason, false);
       else if (status === 'resolved_refund') refundOrderFunds(order, undefined, adminActor(req), reason);
       else splitOrderFunds(order, Number(req.body.refundAmount), adminActor(req), reason);

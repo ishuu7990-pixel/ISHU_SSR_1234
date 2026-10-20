@@ -157,6 +157,7 @@ export interface Order {
   sellerId: string;
   amount: number;
   status: 'payment_pending' | 'funded_in_escrow' | 'in_progress' | 'delivered' | 'completed' | 'disputed' | 'revision' | 'cancelled' | 'draft_review' | 'work_in_progress';
+  previousStatus?: string;
   createdAt: string;
   completedAt?: string;
   dueDate: string;
