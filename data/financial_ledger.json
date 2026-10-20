@@ -1,6 +1,80 @@
 {
   "journals": [
     {
+      "id": "JRN-519b4426-e452-478d-bb51-5851d10a08c3",
+      "reference": "seed",
+      "postingDate": "2026-10-20",
+      "timestamp": "2026-10-20 03:42:25",
+      "description": "Deposit (gateway) - Buyer",
+      "eventType": "DEPOSIT_SETTLED",
+      "idempotencyKey": "DEP-seed-0.9553334011861228",
+      "entries": [
+        {
+          "id": "ENT-519b4426-e452-478d-bb51-5851d10a08c3-1",
+          "journalId": "JRN-519b4426-e452-478d-bb51-5851d10a08c3",
+          "accountCode": "1020",
+          "accountName": "Payment Processor Clearing",
+          "debit": 100000,
+          "credit": 0,
+          "currency": "USD",
+          "description": "Payment processor clearing - deposit received",
+          "userId": "buyer1"
+        },
+        {
+          "id": "ENT-519b4426-e452-478d-bb51-5851d10a08c3-2",
+          "journalId": "JRN-519b4426-e452-478d-bb51-5851d10a08c3",
+          "accountCode": "2010",
+          "accountName": "Buyer Wallets Payable",
+          "debit": 0,
+          "credit": 100000,
+          "currency": "USD",
+          "description": "Credited Buyer available wallet",
+          "userId": "buyer1"
+        }
+      ],
+      "totalDebit": 100000,
+      "totalCredit": 100000,
+      "status": "posted",
+      "actor": "test"
+    },
+    {
+      "id": "JRN-a15d3cb7-2f92-4d41-a0bc-f6a2d082aa58",
+      "reference": "TEST-DEP",
+      "postingDate": "2026-10-20",
+      "timestamp": "2026-10-20 03:42:15",
+      "description": "Deposit (gateway) - Alex Rivera",
+      "eventType": "DEPOSIT_SETTLED",
+      "idempotencyKey": "DEP-TEST-DEP-KEY-1792467735060",
+      "entries": [
+        {
+          "id": "ENT-a15d3cb7-2f92-4d41-a0bc-f6a2d082aa58-1",
+          "journalId": "JRN-a15d3cb7-2f92-4d41-a0bc-f6a2d082aa58",
+          "accountCode": "1020",
+          "accountName": "Payment Processor Clearing",
+          "debit": 1000,
+          "credit": 0,
+          "currency": "USD",
+          "description": "Payment processor clearing - deposit received",
+          "userId": "user_1"
+        },
+        {
+          "id": "ENT-a15d3cb7-2f92-4d41-a0bc-f6a2d082aa58-2",
+          "journalId": "JRN-a15d3cb7-2f92-4d41-a0bc-f6a2d082aa58",
+          "accountCode": "2010",
+          "accountName": "Buyer Wallets Payable",
+          "debit": 0,
+          "credit": 1000,
+          "currency": "USD",
+          "description": "Credited Alex Rivera available wallet",
+          "userId": "user_1"
+        }
+      ],
+      "totalDebit": 1000,
+      "totalCredit": 1000,
+      "status": "posted",
+      "actor": "admin"
+    },
+    {
       "id": "JRN-85551b0b-5ae0-4d74-b0dc-2756955f2e76",
       "reference": "ORD-ord_auto_disputed_1792414841990-RELEASE",
       "postingDate": "2026-10-19",
@@ -9505,6 +9579,32 @@
   ],
   "transactions": [
     {
+      "id": "TXN-519b4426-e452-478d-bb51-5851d10a08c3",
+      "type": "deposit",
+      "amount": 100000,
+      "currency": "USD",
+      "timestamp": "2026-10-20 03:42:25",
+      "status": "completed",
+      "userId": "buyer1",
+      "userName": "Buyer",
+      "userRole": "buyer",
+      "journalId": "JRN-519b4426-e452-478d-bb51-5851d10a08c3",
+      "description": "Deposit (gateway) - Buyer"
+    },
+    {
+      "id": "TXN-a15d3cb7-2f92-4d41-a0bc-f6a2d082aa58",
+      "type": "deposit",
+      "amount": 1000,
+      "currency": "USD",
+      "timestamp": "2026-10-20 03:42:15",
+      "status": "completed",
+      "userId": "user_1",
+      "userName": "Alex Rivera",
+      "userRole": "buyer",
+      "journalId": "JRN-a15d3cb7-2f92-4d41-a0bc-f6a2d082aa58",
+      "description": "Deposit (gateway) - Alex Rivera"
+    },
+    {
       "id": "TXN-85551b0b-5ae0-4d74-b0dc-2756955f2e76",
       "type": "escrow_release",
       "amount": 120,
@@ -12193,12 +12293,12 @@
         "userEmail": "b@x.com",
         "userRole": "buyer",
         "currency": "USD",
-        "availableBalance": 1099234,
+        "availableBalance": 1199234,
         "pendingIncoming": 0,
         "fundsOnHold": 830,
         "pendingWithdrawals": 0,
         "status": "active",
-        "lastActivityAt": "2026-10-19 13:00:42",
+        "lastActivityAt": "2026-10-20 03:42:25",
         "createdAt": "2026-10-14 16:24:49"
       }
     ],
@@ -12370,15 +12470,15 @@
         "id": "WAL-USER_1",
         "userId": "user_1",
         "userName": "Alex Rivera",
-        "userEmail": "alex@workperhour.com",
-        "userRole": "freelancer",
+        "userEmail": "alex@example.com",
+        "userRole": "buyer",
         "currency": "USD",
-        "availableBalance": 1000,
+        "availableBalance": 2000,
         "pendingIncoming": 0,
         "fundsOnHold": 0,
         "pendingWithdrawals": 0,
         "status": "active",
-        "lastActivityAt": "2026-10-19 13:00:42",
+        "lastActivityAt": "2026-10-20 03:42:15",
         "createdAt": "2026-10-15 09:18:32"
       }
     ],
@@ -12388,7 +12488,7 @@
         "id": "WAL-USER_2",
         "userId": "user_2",
         "userName": "Elena Rostova",
-        "userEmail": "elena@design.io",
+        "userEmail": "elena@example.com",
         "userRole": "freelancer",
         "currency": "USD",
         "availableBalance": 41406.4,
@@ -14599,7 +14699,9 @@
     "IDEMP-ADJ-6f22c516-c554-45fc-aae1-d04edeae7ab1",
     "DEP-seed-0.5997802248698016",
     "DEP-TEST-DEP-KEY-1792414842795",
-    "IDEMP-REL-ord_auto_disputed_1792414841990"
+    "IDEMP-REL-ord_auto_disputed_1792414841990",
+    "DEP-TEST-DEP-KEY-1792467735060",
+    "DEP-seed-0.9553334011861228"
   ],
   "escrows": [
     [

@@ -1151,6 +1151,8 @@ interface Order {
   id: string;
   workspaceId?: string;
   orderType?: 'gig' | 'project';
+  gigOrderId?: string;
+  projectOrderId?: string;
   title: string;
   buyerId: string;
   sellerId: string;
@@ -3771,7 +3773,11 @@ app.post('/api/payments/escrow/deposit', requireAuth, rateLimit(20, 60_000), (re
       return res.status(403).json({ error: 'Forbidden: Only the order buyer or administrator can fund escrow.' });
     }
 
-    if (order.status !== 'in_progress') {
+    if (order.status === 'funded_in_escrow' || orderHasEscrow(order.id)) {
+      return res.status(400).json({ error: 'Order escrow is already funded.' });
+    }
+
+    if (order.status !== 'payment_pending' && order.status !== 'in_progress') {
       return res.status(400).json({ error: `Cannot fund escrow for order in status "${order.status}"` });
     }
 
@@ -6023,12 +6029,21 @@ async function processProposalAccept(req: any, res: any) {
     ensureWallet(proj.buyerId);
     ensureWallet(proposal.freelancerId);
 
-    const workspace = workspaceService.createWorkspace({
-      buyerId: proj.buyerId,
-      sellerId: proposal.freelancerId,
-      originType: 'project',
-      originId: proj.id
-    });
+    let workspace = Array.from(workspaceService.getWorkspacesForUser(proj.buyerId)).find(w =>
+      w.sellerId === proposal.freelancerId &&
+      w.originType === 'project' &&
+      w.originId === proj.id
+    );
+    let createdNewWorkspace = false;
+    if (!workspace) {
+      workspace = workspaceService.createWorkspace({
+        buyerId: proj.buyerId,
+        sellerId: proposal.freelancerId,
+        originType: 'project',
+        originId: proj.id
+      });
+      createdNewWorkspace = true;
+    }
 
     const orderId = 'ord_' + randomUUID().slice(0, 12);
     const today = new Date().toISOString().split('T')[0];
@@ -6039,6 +6054,7 @@ async function processProposalAccept(req: any, res: any) {
     // Create Order object with transient status
     const order: Order = {
       id: orderId,
+      projectOrderId: orderId,
       workspaceId: workspace.workspaceId,
       orderType: 'project',
       title: proj.title,
@@ -6112,7 +6128,9 @@ async function processProposalAccept(req: any, res: any) {
       delete proposal.workstreamOrderId;
       delete proposal.offerId;
 
-      workspaceService.deleteWorkspace(workspace.workspaceId);
+      if (createdNewWorkspace) {
+        workspaceService.deleteWorkspace(workspace.workspaceId);
+      }
 
       await saveOrdersToDisk();
       await saveOffersToDisk();
@@ -6226,16 +6244,61 @@ app.post('/api/orders', requireAuth, rateLimit(30, 60_000), async (req, res) => 
     }
     const serverDerivedDueDate = new Date(Date.now() + deliveryDays * 86400000).toISOString().split('T')[0];
 
+    const isGig = Boolean(req.body?.gigId);
+    const isProject = Boolean(req.body?.projectId);
+    const orderType: 'gig' | 'project' | undefined = isGig ? 'gig' : (isProject ? 'project' : undefined);
+    const gigOrderId = isGig ? id : undefined;
+    const projectOrderId = isProject ? id : undefined;
+
+    let workspaceId = req.body?.workspaceId;
+    if (!workspaceId) {
+      const ws = workspaceService.createWorkspace({
+        buyerId,
+        sellerId,
+        originType: isGig ? 'gig' : 'project',
+        originId: req.body?.gigId || req.body?.projectId || id,
+        activeOrderId: id
+      });
+      workspaceId = ws.workspaceId;
+    }
+
     let newOrd: Order;
     if (isInquiry) {
-      newOrd = { id, title, buyerId, sellerId, amount: 0, status: 'in_progress', createdAt: today, dueDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0], gigId: req.body.gigId, projectId: req.body.projectId, ...(requirements ? { requirements } : {}) };
+      newOrd = {
+        id,
+        workspaceId,
+        ...(orderType ? { orderType } : {}),
+        ...(gigOrderId ? { gigOrderId } : {}),
+        ...(projectOrderId ? { projectOrderId } : {}),
+        title,
+        buyerId,
+        sellerId,
+        amount: 0,
+        status: 'in_progress',
+        createdAt: today,
+        dueDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
+        gigId: req.body.gigId,
+        projectId: req.body.projectId,
+        ...(requirements ? { requirements } : {})
+      };
     } else {
       newOrd = {
-        id, title, buyerId, sellerId, amount: rawAmount, status: 'payment_pending', createdAt: today,
+        id,
+        workspaceId,
+        ...(orderType ? { orderType } : {}),
+        ...(gigOrderId ? { gigOrderId } : {}),
+        ...(projectOrderId ? { projectOrderId } : {}),
+        title,
+        buyerId,
+        sellerId,
+        amount: rawAmount,
+        status: 'payment_pending',
+        createdAt: today,
         dueDate: serverDerivedDueDate,
         escrowProtectionStartDate: today,
         escrowProtectionEndDate: new Date(Date.now() + DEFAULT_SITE_SETTINGS.commission.escrowProtectionDays * 86400000).toISOString().split('T')[0],
-        gigId: req.body.gigId, projectId: req.body.projectId,
+        gigId: req.body.gigId,
+        projectId: req.body.projectId,
         feeBreakdown: financeLedger.quoteOrder(rawAmount),
         ...(requirements ? { requirements } : {})
       };
@@ -6500,7 +6563,7 @@ app.post('/api/orders/:id/offers', requireAuth, rateLimit(20, 60_000), (req, res
       }
       // PeoplePerHour Gig Rule: When a buyer orders a Gig, it is already funded in escrow.
       // The seller cannot send a new proposal until the first invoice has been paid.
-      if (order.gigId && activeEscrow > 0 && !hasPaidFirstInvoice) {
+      if ((order.orderType === 'gig' || (order.gigId && !order.projectId)) && activeEscrow > 0 && !hasPaidFirstInvoice) {
         return res.status(409).json({ error: 'This Gig is already funded in escrow. Please raise and get your first invoice paid before sending a follow-on proposal.' });
       }
     }
@@ -6719,45 +6782,62 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
 
     } else if (isInitialFunding) {
       // Initial proposal on an unfunded order/inquiry: funds this order's escrow directly under order.id
+      if (order.status === 'funded_in_escrow' || orderHasEscrow(order.id)) {
+        return res.status(409).json({ error: 'Order escrow is already funded.' });
+      }
       if (order.status !== 'in_progress' && order.status !== 'payment_pending') {
         return res.status(409).json({ error: 'Cannot fund escrow for order in current status.' });
       }
       const newTitle = offer.kind === 'proposal' && (/^inquiry:/i.test(order.title) || !order.amount) ? offer.title : order.title;
+      const prevStatus = order.status;
       order.status = 'payment_pending';
       await saveOrdersToDisk(); // CRASH SAFE POINT: Order is durable as payment_pending before ledger funding
 
-      fundOrderEscrowWithEvent({ orderId: order.id, orderTitle: newTitle, amount: offer.amount, buyerId: order.buyerId, sellerId: order.sellerId, actor: `user:${order.buyerId}` });
-      order.title = newTitle;
-      order.amount = offer.amount;
-      order.status = 'funded_in_escrow';
-      order.escrowProtectionStartDate = today;
-      order.escrowProtectionEndDate = protectionEnd;
-      order.feeBreakdown = financeLedger.quoteOrder(offer.amount);
-      if (offer.kind === 'proposal' && offer.deliveryDays) {
-        order.dueDate = new Date(Date.now() + offer.deliveryDays * 86400000).toISOString().split('T')[0];
-      }
-      offer.orderId = order.id;
-      offer.status = 'accepted';
-      if (offer.kind === 'proposal') {
-        const linkedProp = findLinkedProposalForOffer(offer, order);
-        if (linkedProp) {
-          linkedProp.status = 'accepted';
-          linkedProp.workstreamOrderId = order.id;
-          linkedProp.offerId = offer.id;
-          order.proposalId = linkedProp.id;
-          await saveProposalsToDisk();
+      try {
+        fundOrderEscrowWithEvent({ orderId: order.id, orderTitle: newTitle, amount: offer.amount, buyerId: order.buyerId, sellerId: order.sellerId, actor: `user:${order.buyerId}` });
+        order.title = newTitle;
+        order.amount = offer.amount;
+        order.status = 'funded_in_escrow';
+        order.escrowProtectionStartDate = today;
+        order.escrowProtectionEndDate = protectionEnd;
+        order.feeBreakdown = financeLedger.quoteOrder(offer.amount);
+        if (offer.kind === 'proposal' && offer.deliveryDays) {
+          order.dueDate = new Date(Date.now() + offer.deliveryDays * 86400000).toISOString().split('T')[0];
         }
+        offer.orderId = order.id;
+        offer.status = 'accepted';
+        if (offer.kind === 'proposal') {
+          const linkedProp = findLinkedProposalForOffer(offer, order);
+          if (linkedProp) {
+            linkedProp.status = 'accepted';
+            linkedProp.workstreamOrderId = order.id;
+            linkedProp.offerId = offer.id;
+            order.proposalId = linkedProp.id;
+            await saveProposalsToDisk();
+          }
+        }
+        await saveOrdersToDisk();
+        postOfferMessage(order, offer, null, `${offer.number} was accepted and escrow was funded ($${offer.amount}).`, 'offer_accepted');
+      } catch (fundingErr: any) {
+        order.status = prevStatus;
+        await saveOrdersToDisk();
+        return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for offer.' });
       }
-      await saveOrdersToDisk();
-      postOfferMessage(order, offer, null, `${offer.number} was accepted and escrow was funded ($${offer.amount}).`, 'offer_accepted');
     } else if (isFollowOnAfterCompletion) {
       // PeoplePerHour Follow-On Proposal / Deposit accepted in the same WorkStream after previous invoice was paid
       // Correct model: New Order in same Workspace
       const newOrderId = 'ord_' + randomUUID().slice(0, 12);
+      const isGigFollowOn = order.orderType === 'gig' || (Boolean(order.gigId) && !order.projectId);
+      const orderType: 'gig' | 'project' = isGigFollowOn ? 'gig' : 'project';
+      const gigOrderId = orderType === 'gig' ? newOrderId : undefined;
+      const projectOrderId = orderType === 'project' ? newOrderId : undefined;
+
       const newOrder: Order = {
         id: newOrderId,
         workspaceId: order.workspaceId,
-        orderType: order.orderType,
+        orderType,
+        ...(gigOrderId ? { gigOrderId } : {}),
+        ...(projectOrderId ? { projectOrderId } : {}),
         title: offer.title,
         buyerId: order.buyerId,
         sellerId: order.sellerId,

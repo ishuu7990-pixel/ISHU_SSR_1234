@@ -129,6 +129,8 @@ export interface Order {
   id: string;
   workspaceId?: string;
   orderType?: 'gig' | 'project';
+  gigOrderId?: string;
+  projectOrderId?: string;
   title: string;
   buyerId: string;
   sellerId: string;
