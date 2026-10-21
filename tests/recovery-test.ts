@@ -20,7 +20,7 @@ async function runRecoveryTest() {
   ];
 
   // Mock ledger (no escrow)
-  const financeLedger = { getEscrow: () => null };
+  const financeLedger = { getEscrow: (_orderId?: string) => null };
 
   // Run recovery logic
   let recoveryNeeded = false;

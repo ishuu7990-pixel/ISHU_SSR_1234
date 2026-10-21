@@ -4,11 +4,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_FEE_CONFIG, calculateOrderFees, percentOfCents, validateFeeConfig, type FeeConfig } from '../shared/fees.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.join(__dirname, '../../data');
-const LEDGER_FILE = path.join(DATA_DIR, 'financial_ledger.json');
-
-
 // Authoritative Double-Entry Ledger & Financial Engine for WorkPerHour
 
 export interface ChartOfAccount {
@@ -224,7 +219,6 @@ export class FinanceLedgerEngine {
   private maximumWithdrawalAmount: number = 5000;
 
   constructor() {
-    this.seedInitialFinancialData();
     this.loadFromDisk();
   }
 
@@ -1259,78 +1253,80 @@ export class FinanceLedgerEngine {
   private loadFailed = false;
 
   private saveToDisk() {
-    if (process.env.NODE_ENV === 'test') return;
     if (this.loadFailed) {
       console.warn('Skipping ledger save to disk because initial load failed (preventing file overwrite).');
       return;
     }
     try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
-
-      const data = {
-        journals: this.journals,
-        transactions: this.transactions,
-        wallets: Array.from(this.wallets.entries()),
-        auditLogs: this.auditLogs,
-        exceptions: this.exceptions,
-        idempotencyKeys: Array.from(this.idempotencyKeys),
-        escrows: Array.from(this.escrows.entries()),
-        payouts: Array.from(this.payouts.entries()),
-        opResults: Array.from(this.opResults.entries()),
-        config: {
-          platformCommissionRate: this.platformCommissionRate,
-          buyerFeePercent: this.buyerFeePercent,
-          smallOrderFee: this.smallOrderFee,
-          smallOrderThreshold: this.smallOrderThreshold,
-          refundClientFeesOnFullRefund: this.refundClientFeesOnFullRefund,
-          minimumOrderAmount: this.minimumOrderAmount,
-          minimumWithdrawalAmount: this.minimumWithdrawalAmount,
-          maximumWithdrawalAmount: this.maximumWithdrawalAmount
-        }
-      };
-
-      const tempFile = path.join(DATA_DIR, `financial_ledger.json.tmp.${randomUUID()}`);
-      fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), 'utf-8');
-      fs.renameSync(tempFile, LEDGER_FILE);
+      this.persistToPostgres();
     } catch (err) {
-      console.error('Failed to save financial ledger to disk:', err);
+      console.error('Failed to save financial ledger:', err);
+    }
+  }
+
+  public getSerializableState() {
+    return {
+      journals: this.journals,
+      transactions: this.transactions,
+      wallets: Array.from(this.wallets.entries()),
+      auditLogs: this.auditLogs,
+      exceptions: this.exceptions,
+      idempotencyKeys: Array.from(this.idempotencyKeys),
+      escrows: Array.from(this.escrows.entries()),
+      payouts: Array.from(this.payouts.entries()),
+      opResults: Array.from(this.opResults.entries()),
+      config: {
+        platformCommissionRate: this.platformCommissionRate,
+        buyerFeePercent: this.buyerFeePercent,
+        smallOrderFee: this.smallOrderFee,
+        smallOrderThreshold: this.smallOrderThreshold,
+        refundClientFeesOnFullRefund: this.refundClientFeesOnFullRefund,
+        minimumOrderAmount: this.minimumOrderAmount,
+        minimumWithdrawalAmount: this.minimumWithdrawalAmount,
+        maximumWithdrawalAmount: this.maximumWithdrawalAmount
+      }
+    };
+  }
+
+  public persistToPostgres() {
+    try {
+      const state = this.getSerializableState();
+      import('../../server/db/postgresStore.js').then(({ postgresStore }) => {
+        postgresStore.saveLedgerState(state).catch(err => {
+          console.error('[FinanceLedger] Failed to persist state to PostgreSQL:', err);
+        });
+      }).catch(() => {});
+    } catch (err) {
+      console.error('[FinanceLedger] Error initiating postgres persist:', err);
+    }
+  }
+
+  public loadFromState(data: any) {
+    if (!data || typeof data !== 'object') return;
+    if (data.journals && Array.isArray(data.journals)) this.journals = data.journals;
+    if (data.transactions && Array.isArray(data.transactions)) this.transactions = data.transactions;
+    if (data.wallets && Array.isArray(data.wallets)) this.wallets = new Map(data.wallets);
+    if (data.auditLogs && Array.isArray(data.auditLogs)) this.auditLogs = data.auditLogs;
+    if (data.exceptions && Array.isArray(data.exceptions)) this.exceptions = data.exceptions;
+    if (data.idempotencyKeys && Array.isArray(data.idempotencyKeys)) this.idempotencyKeys = new Set(data.idempotencyKeys);
+    if (data.escrows && Array.isArray(data.escrows)) this.escrows = new Map(data.escrows);
+    if (data.payouts && Array.isArray(data.payouts)) this.payouts = new Map(data.payouts);
+    if (data.opResults && Array.isArray(data.opResults)) this.opResults = new Map(data.opResults);
+
+    if (data.config) {
+      this.platformCommissionRate = data.config.platformCommissionRate ?? this.platformCommissionRate;
+      this.buyerFeePercent = data.config.buyerFeePercent ?? this.buyerFeePercent;
+      this.smallOrderFee = data.config.smallOrderFee ?? this.smallOrderFee;
+      this.smallOrderThreshold = data.config.smallOrderThreshold ?? this.smallOrderThreshold;
+      this.refundClientFeesOnFullRefund = data.config.refundClientFeesOnFullRefund ?? this.refundClientFeesOnFullRefund;
+      this.minimumOrderAmount = data.config.minimumOrderAmount ?? this.minimumOrderAmount;
+      this.minimumWithdrawalAmount = data.config.minimumWithdrawalAmount ?? this.minimumWithdrawalAmount;
+      this.maximumWithdrawalAmount = data.config.maximumWithdrawalAmount ?? this.maximumWithdrawalAmount;
     }
   }
 
   public loadFromDisk() {
-    if (process.env.NODE_ENV === 'test') return;
-    try {
-      if (!fs.existsSync(LEDGER_FILE)) return;
-
-      const raw = fs.readFileSync(LEDGER_FILE, 'utf-8');
-      const data = JSON.parse(raw);
-
-      if (data.journals && Array.isArray(data.journals)) this.journals = data.journals;
-      if (data.transactions && Array.isArray(data.transactions)) this.transactions = data.transactions;
-      if (data.wallets && Array.isArray(data.wallets)) this.wallets = new Map(data.wallets);
-      if (data.auditLogs && Array.isArray(data.auditLogs)) this.auditLogs = data.auditLogs;
-      if (data.exceptions && Array.isArray(data.exceptions)) this.exceptions = data.exceptions;
-      if (data.idempotencyKeys && Array.isArray(data.idempotencyKeys)) this.idempotencyKeys = new Set(data.idempotencyKeys);
-      if (data.escrows && Array.isArray(data.escrows)) this.escrows = new Map(data.escrows);
-      if (data.payouts && Array.isArray(data.payouts)) this.payouts = new Map(data.payouts);
-      if (data.opResults && Array.isArray(data.opResults)) this.opResults = new Map(data.opResults);
-
-      if (data.config) {
-        this.platformCommissionRate = data.config.platformCommissionRate ?? this.platformCommissionRate;
-        this.buyerFeePercent = data.config.buyerFeePercent ?? this.buyerFeePercent;
-        this.smallOrderFee = data.config.smallOrderFee ?? this.smallOrderFee;
-        this.smallOrderThreshold = data.config.smallOrderThreshold ?? this.smallOrderThreshold;
-        this.refundClientFeesOnFullRefund = data.config.refundClientFeesOnFullRefund ?? this.refundClientFeesOnFullRefund;
-        this.minimumOrderAmount = data.config.minimumOrderAmount ?? this.minimumOrderAmount;
-        this.minimumWithdrawalAmount = data.config.minimumWithdrawalAmount ?? this.minimumWithdrawalAmount;
-        this.maximumWithdrawalAmount = data.config.maximumWithdrawalAmount ?? this.maximumWithdrawalAmount;
-      }
-    } catch (err) {
-      this.loadFailed = true;
-      console.error('Failed to load financial ledger from disk (preventing overwrite of corrupted/unreadable state):', err);
-    }
+    // Deprecated: Ledger state is now loaded from PostgreSQL via hydrateStoreFromPostgres()
   }
 
   public resetToCleanState() {
@@ -1342,11 +1338,7 @@ export class FinanceLedgerEngine {
     this.escrows.clear();
     this.payouts.clear();
     this.opResults.clear();
-    for (const w of this.wallets.values()) {
-      w.availableBalance = 0;
-      w.fundsOnHold = 0;
-      w.pendingWithdrawals = 0;
-    }
+    this.wallets.clear();
     this.saveToDisk();
   }
 }

@@ -1,5 +1,5 @@
 import assert from 'node:assert';
-import { Proposal, Order } from '../types';
+import { Proposal, Order } from '../src/types';
 
 const orders: Order[] = [
   { 
@@ -19,6 +19,11 @@ const proposal: Proposal = {
   id: 'prop_2', 
   projectId: 'proj_1', 
   freelancerId: 'u2', 
+  freelancerName: 'Freelancer Two',
+  freelancerAvatar: 'https://avatar.png',
+  freelancerTitle: 'Dev',
+  deliveryDays: 5,
+  createdAt: '2023-01-02',
   status: 'pending', 
   bidAmount: 100, 
   coverLetter: '' 

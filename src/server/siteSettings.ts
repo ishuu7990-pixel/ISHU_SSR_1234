@@ -58,6 +58,7 @@ export interface GigsProjectsOrdersSettings {
   autoCompleteDeliveredDays: number; // default 3 days
   autoCompleteDeliveredEnabled: boolean; // default true (toggle auto-accept on/off with one setting)
   allowBuyerCancellationRequests: boolean;
+  featuredGigFee: number; // Default 10
 }
 
 export interface WalletsWithdrawalsSettings {
@@ -172,7 +173,8 @@ export const DEFAULT_SITE_SETTINGS: SiteSettingsState = {
     maxActiveOrdersPerFreelancer: 0, // 0 for unlimited (allows high-velocity sellers and buyers without artificial caps)
     autoCompleteDeliveredDays: 3,
     autoCompleteDeliveredEnabled: true,
-    allowBuyerCancellationRequests: true
+    allowBuyerCancellationRequests: true,
+    featuredGigFee: 10
   },
   wallets: {
     minimumWithdrawalAmount: 50,
@@ -223,73 +225,44 @@ export const DEFAULT_SITE_SETTINGS: SiteSettingsState = {
 export class SiteSettingsService {
   private settings: SiteSettingsState;
   private history: SettingsHistoryItem[] = [];
-  private settingsFilePath: string;
 
   constructor() {
-    this.settingsFilePath = path.join(process.cwd(), 'data', 'site_settings.json');
     this.settings = JSON.parse(JSON.stringify(DEFAULT_SITE_SETTINGS));
     this.loadFromDisk();
-    this.seedInitialHistory();
     this.syncFeesToLedger();
   }
 
-  private loadFromDisk() {
-    try {
-      const dir = path.dirname(this.settingsFilePath);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      if (fs.existsSync(this.settingsFilePath)) {
-        const raw = fs.readFileSync(this.settingsFilePath, 'utf-8');
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object') {
-          this.settings = {
-            website: { ...DEFAULT_SITE_SETTINGS.website, ...(parsed.website || {}) },
-            commission: { ...DEFAULT_SITE_SETTINGS.commission, ...(parsed.commission || {}) },
-            memberships: { ...DEFAULT_SITE_SETTINGS.memberships, ...(parsed.memberships || {}) },
-            marketplace: { ...DEFAULT_SITE_SETTINGS.marketplace, ...(parsed.marketplace || {}) },
-            wallets: { ...DEFAULT_SITE_SETTINGS.wallets, ...(parsed.wallets || {}) },
-            localization: { ...DEFAULT_SITE_SETTINGS.localization, ...(parsed.localization || {}) },
-            security: { ...DEFAULT_SITE_SETTINGS.security, ...(parsed.security || {}) },
-            integrations: { ...DEFAULT_SITE_SETTINGS.integrations, ...(parsed.integrations || {}) },
-          };
-        }
-      }
-    } catch (e) {
-      console.error('[SiteSettingsService] Failed to load site_settings.json from disk:', e);
+  public loadFromState(parsed: any) {
+    if (parsed && typeof parsed === 'object') {
+      this.settings = {
+        website: { ...DEFAULT_SITE_SETTINGS.website, ...(parsed.website || {}) },
+        commission: { ...DEFAULT_SITE_SETTINGS.commission, ...(parsed.commission || {}) },
+        memberships: { ...DEFAULT_SITE_SETTINGS.memberships, ...(parsed.memberships || {}) },
+        marketplace: { ...DEFAULT_SITE_SETTINGS.marketplace, ...(parsed.marketplace || {}) },
+        wallets: { ...DEFAULT_SITE_SETTINGS.wallets, ...(parsed.wallets || {}) },
+        localization: { ...DEFAULT_SITE_SETTINGS.localization, ...(parsed.localization || {}) },
+        security: { ...DEFAULT_SITE_SETTINGS.security, ...(parsed.security || {}) },
+        integrations: { ...DEFAULT_SITE_SETTINGS.integrations, ...(parsed.integrations || {}) },
+      };
+      this.syncFeesToLedger();
     }
+  }
+
+  private loadFromDisk() {
+    // Deprecated: Site settings are now loaded from PostgreSQL via hydrateStoreFromPostgres()
     this.syncFeesToLedger();
   }
 
   public saveToDisk() {
     try {
-      const dir = path.dirname(this.settingsFilePath);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(this.settingsFilePath, JSON.stringify(this.settings, null, 2), 'utf-8');
+      import('../../server/db/postgresStore.js').then(({ postgresStore }) => {
+        postgresStore.saveSiteSettings(this.settings).catch(err => {
+          console.error('[SiteSettingsService] Failed to persist to PostgreSQL:', err);
+        });
+      }).catch(() => {});
     } catch (e) {
-      console.error('[SiteSettingsService] Failed to save site_settings.json to disk:', e);
+      console.error('[SiteSettingsService] Failed to save site settings:', e);
     }
-  }
-
-  private seedInitialHistory() {
-    this.history.push({
-      id: 'SET-HIST-101',
-      timestamp: '2026-10-01 10:00:00',
-      section: 'Platform Commission',
-      settingName: 'Platform Commission (%)',
-      oldValue: 'Initial Configuration',
-      newValue: `${DEFAULT_FEE_CONFIG.commissionPercent}%`,
-      actor: 'System Setup',
-      notes: `Standard ${DEFAULT_FEE_CONFIG.commissionPercent}% platform take rate initialized with 14-day escrow protection.`
-    });
-    this.history.push({
-      id: 'SET-HIST-102',
-      timestamp: '2026-10-05 09:30:00',
-      section: 'Wallets & Withdrawals',
-      settingName: 'Manual Review Threshold',
-      oldValue: '$1,000.00',
-      newValue: '$500.00',
-      actor: 'Admin Chief',
-      notes: 'Tightened payout compliance threshold to $500 for enhanced risk management.'
-    });
   }
 
   public getSettings(): SiteSettingsState {

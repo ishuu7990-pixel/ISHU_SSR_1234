@@ -59,7 +59,7 @@ export const AdminDisputesModule: React.FC<AdminDisputesModuleProps> = ({
         d.orderId.toLowerCase().includes(q) ||
         d.raisedBy.toLowerCase().includes(q) ||
         d.reason.toLowerCase().includes(q) ||
-        d.evidence.toLowerCase().includes(q);
+        (d.evidence || '').toLowerCase().includes(q);
       const matchesStatus = statusFilter === 'all' || d.status === statusFilter;
       return matchesSearch && matchesStatus;
     }).sort((a, b) => {

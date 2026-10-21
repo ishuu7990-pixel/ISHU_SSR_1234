@@ -4,10 +4,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Workspace, Order } from '../types.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.join(__dirname, '../../data');
-const WORKSPACES_FILE = path.join(DATA_DIR, 'workspaces.json');
-
 class WorkspaceService {
   private workspaces: Map<string, Workspace> = new Map();
 
@@ -15,29 +11,33 @@ class WorkspaceService {
     this.loadFromDisk();
   }
 
-  private loadFromDisk() {
-    try {
-      if (fs.existsSync(WORKSPACES_FILE)) {
-        const raw = fs.readFileSync(WORKSPACES_FILE, 'utf-8');
-        const list = JSON.parse(raw);
-        if (Array.isArray(list)) {
-          for (const w of list) {
-            if (w.workspaceId) this.workspaces.set(w.workspaceId, w);
-          }
-        }
+  public loadFromList(list: any[]) {
+    if (Array.isArray(list)) {
+      this.workspaces.clear();
+      for (const w of list) {
+        if (w.workspaceId) this.workspaces.set(w.workspaceId, w);
       }
-    } catch (err) {
-      console.error('Failed to load workspaces from disk:', err);
     }
+  }
+
+  public listAll(): Workspace[] {
+    return Array.from(this.workspaces.values());
+  }
+
+  private loadFromDisk() {
+    // Deprecated: Workspaces are now loaded from PostgreSQL via hydrateStoreFromPostgres()
   }
 
   public saveToDisk() {
     try {
-      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
       const list = Array.from(this.workspaces.values());
-      fs.writeFileSync(WORKSPACES_FILE, JSON.stringify(list, null, 2), 'utf-8');
+      import('../../server/db/postgresStore.js').then(({ postgresStore }) => {
+        postgresStore.saveWorkspaces(list).catch(err => {
+          console.error('[WorkspaceService] Failed to persist workspaces to PostgreSQL:', err);
+        });
+      }).catch(() => {});
     } catch (err) {
-      console.error('Failed to save workspaces to disk:', err);
+      console.error('Failed to save workspaces:', err);
     }
   }
 

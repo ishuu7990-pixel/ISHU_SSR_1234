@@ -40,25 +40,15 @@ const DEFAULT_STATE: PaymentGatewaysState = {
   sandbox: JSON.parse(JSON.stringify(DEFAULT_ENV_GATEWAYS))
 };
 
-const DATA_DIR = path.join(process.cwd(), 'data');
-const GATEWAYS_FILE = path.join(DATA_DIR, 'payment_gateways.json');
-const KEY_FILE = path.join(DATA_DIR, '.encryption_key');
 const ALGORITHM = 'aes-256-cbc';
 
 function getEncryptionKey(): Buffer {
-  let keyHex = process.env.GATEWAY_ENCRYPTION_KEY;
-  if (!keyHex) {
-    try {
-      if (fs.existsSync(KEY_FILE)) {
-        keyHex = fs.readFileSync(KEY_FILE, 'utf-8').trim();
-      } else {
-        if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-        keyHex = crypto.randomBytes(32).toString('hex');
-        fs.writeFileSync(KEY_FILE, keyHex, { mode: 0o600 });
-      }
-    } catch {
-      keyHex = crypto.randomBytes(32).toString('hex');
+  const keyHex = process.env.GATEWAY_ENCRYPTION_KEY;
+  if (!keyHex || keyHex.trim() === '') {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('CRITICAL: GATEWAY_ENCRYPTION_KEY secret is required in production.');
     }
+    return crypto.createHash('sha256').update('dev_mode_fixed_gateway_encryption_key_12345').digest();
   }
   return crypto.createHash('sha256').update(keyHex).digest();
 }
@@ -107,57 +97,53 @@ export class PaymentGatewayManager {
     this.loadFromDisk();
   }
 
-  private loadFromDisk() {
-    try {
-      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-      if (fs.existsSync(GATEWAYS_FILE)) {
-        const raw = fs.readFileSync(GATEWAYS_FILE, 'utf-8');
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object') {
-          this.state = {
-            production: {
-              paypal: { ...DEFAULT_GATEWAY, ...(parsed.production?.paypal || {}) },
-              stripe: { ...DEFAULT_GATEWAY, ...(parsed.production?.stripe || {}) },
-              razorpay: { ...DEFAULT_GATEWAY, ...(parsed.production?.razorpay || {}) }
-            },
-            sandbox: {
-              paypal: { ...DEFAULT_GATEWAY, ...(parsed.sandbox?.paypal || {}) },
-              stripe: { ...DEFAULT_GATEWAY, ...(parsed.sandbox?.stripe || {}) },
-              razorpay: { ...DEFAULT_GATEWAY, ...(parsed.sandbox?.razorpay || {}) }
-            }
-          };
-          // Automatically migrate any plaintext secrets to encrypted storage on load/save
-          this.saveToDisk();
+  public loadFromState(parsed: any) {
+    if (parsed && typeof parsed === 'object') {
+      this.state = {
+        production: {
+          paypal: { ...DEFAULT_GATEWAY, ...(parsed.production?.paypal || {}) },
+          stripe: { ...DEFAULT_GATEWAY, ...(parsed.production?.stripe || {}) },
+          razorpay: { ...DEFAULT_GATEWAY, ...(parsed.production?.razorpay || {}) }
+        },
+        sandbox: {
+          paypal: { ...DEFAULT_GATEWAY, ...(parsed.sandbox?.paypal || {}) },
+          stripe: { ...DEFAULT_GATEWAY, ...(parsed.sandbox?.stripe || {}) },
+          razorpay: { ...DEFAULT_GATEWAY, ...(parsed.sandbox?.razorpay || {}) }
         }
-      } else {
-        this.saveToDisk();
-      }
-    } catch (err) {
-      console.error('[PaymentGatewayManager] Failed to load payment_gateways.json:', err);
+      };
     }
+  }
+
+  private loadFromDisk() {
+    // Deprecated: Payment gateways are now loaded from PostgreSQL via hydrateStoreFromPostgres()
+  }
+
+  public getEncryptedState(): PaymentGatewaysState {
+    return {
+      production: {
+        paypal: { ...this.state.production.paypal, clientSecret: encryptSecret(this.state.production.paypal.clientSecret) },
+        stripe: { ...this.state.production.stripe, clientSecret: encryptSecret(this.state.production.stripe.clientSecret) },
+        razorpay: { ...this.state.production.razorpay, clientSecret: encryptSecret(this.state.production.razorpay.clientSecret) }
+      },
+      sandbox: {
+        paypal: { ...this.state.sandbox.paypal, clientSecret: encryptSecret(this.state.sandbox.paypal.clientSecret) },
+        stripe: { ...this.state.sandbox.stripe, clientSecret: encryptSecret(this.state.sandbox.stripe.clientSecret) },
+        razorpay: { ...this.state.sandbox.razorpay, clientSecret: encryptSecret(this.state.sandbox.razorpay.clientSecret) }
+      }
+    };
   }
 
   public saveToDisk() {
     try {
-      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-      
-      // Ensure secrets are encrypted before writing to disk
-      const secureState: PaymentGatewaysState = {
-        production: {
-          paypal: { ...this.state.production.paypal, clientSecret: encryptSecret(this.state.production.paypal.clientSecret) },
-          stripe: { ...this.state.production.stripe, clientSecret: encryptSecret(this.state.production.stripe.clientSecret) },
-          razorpay: { ...this.state.production.razorpay, clientSecret: encryptSecret(this.state.production.razorpay.clientSecret) }
-        },
-        sandbox: {
-          paypal: { ...this.state.sandbox.paypal, clientSecret: encryptSecret(this.state.sandbox.paypal.clientSecret) },
-          stripe: { ...this.state.sandbox.stripe, clientSecret: encryptSecret(this.state.sandbox.stripe.clientSecret) },
-          razorpay: { ...this.state.sandbox.razorpay, clientSecret: encryptSecret(this.state.sandbox.razorpay.clientSecret) }
-        }
-      };
+      const secureState = this.getEncryptedState();
 
-      fs.writeFileSync(GATEWAYS_FILE, JSON.stringify(secureState, null, 2), 'utf-8');
+      import('../../server/db/postgresStore.js').then(({ postgresStore }) => {
+        postgresStore.savePaymentGateways(secureState).catch(err => {
+          console.error('[PaymentGatewayManager] Failed to persist to PostgreSQL:', err);
+        });
+      }).catch(() => {});
     } catch (err) {
-      console.error('[PaymentGatewayManager] Failed to save payment_gateways.json:', err);
+      console.error('[PaymentGatewayManager] Failed to save payment gateways:', err);
     }
   }
 

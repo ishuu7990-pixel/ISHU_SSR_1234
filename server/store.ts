@@ -5,16 +5,9 @@ import { randomBytes } from 'crypto';
 import bcrypt from 'bcryptjs';
 import { financeLedger } from '../src/server/financeLedger.js';
 import { siteSettings, DEFAULT_SITE_SETTINGS } from '../src/server/siteSettings.js';
+import { workspaceService } from '../src/server/workspaceService.js';
+import { paymentGatewayManager } from '../src/server/paymentGateways.js';
 import { OrderFeeBreakdown } from '../src/shared/fees.js';
-import {
-  SEED_USERS,
-  SEED_GIGS,
-  SEED_PROJECTS,
-  SEED_PROPOSALS,
-  SEED_ORDERS,
-  SEED_REVIEWS,
-  SEED_MESSAGES
-} from '../src/data/completeSeedDataset.js';
 
 export { financeLedger, siteSettings, DEFAULT_SITE_SETTINGS };
 
@@ -22,322 +15,60 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 export const ROOT_DIR = path.resolve(__dirname, '..');
 export const DATA_DIR = path.join(ROOT_DIR, 'data');
-export const MESSAGES_FILE = path.join(DATA_DIR, 'workstream_messages.json');
-export const ORDERS_FILE = path.join(DATA_DIR, 'workstream_orders.json');
-export const REVIEWS_FILE = path.join(DATA_DIR, 'workstream_reviews.json');
-export const UPLOAD_INDEX_FILE = path.join(DATA_DIR, 'workstream_uploads.json');
 export const WORKSTREAM_UPLOADS_DIR = path.join(DATA_DIR, 'workstream_uploads');
-export const WORKSTREAM_UPLOAD_INDEX_FILE = path.join(DATA_DIR, 'workstream_upload_index.json');
 
-// Interfaces
-export interface User {
-  id: string;
-  name: string;
-  username?: string;
-  email: string;
-  mobile?: string;
-  role: 'user' | 'admin' | 'super_admin' | 'moderator' | 'support' | string;
-  avatar: string;
-  title: string;
-  rating: number;
-  reviewsCount: number;
-  hourlyRate: number;
-  earned: number;
-  completedJobs: number;
-  bio: string;
-  skills: string[];
-  status: 'active' | 'suspended' | 'restricted' | 'deactivated';
-  verified: boolean;
-  emailVerified?: boolean;
-  mobileVerified?: boolean;
-  walletBalance: number;
-  createdAt: string;
-  isFlagged?: boolean;
-  flagReason?: string;
-  password?: string;
-  sessionVersion?: number;
-  knownDevices?: string[];
-  isAvailableNow?: boolean;
-}
+// Canonical Interfaces from src/types.js
+import type {
+  User,
+  GigExtra,
+  Gig,
+  Project,
+  Proposal,
+  Order,
+  Dispute,
+  WorkstreamOfferKind,
+  WorkstreamOfferStatus,
+  WorkstreamOffer,
+  CustomInvoice,
+  Refund,
+  Payout,
+  Category,
+  Review,
+  SupportTicket,
+  AuditLog,
+  Message,
+  UserEmail,
+  SiteFeeSettings,
+  WorkstreamUploadRecord,
+  Notification
+} from '../src/types.js';
 
-export interface GigExtra {
-  id: string;
-  title: string;
-  price: number;
-}
+export type {
+  User,
+  GigExtra,
+  Gig,
+  Project,
+  Proposal,
+  Order,
+  Dispute,
+  WorkstreamOfferKind,
+  WorkstreamOfferStatus,
+  WorkstreamOffer,
+  CustomInvoice,
+  Refund,
+  Payout,
+  Category,
+  Review,
+  SupportTicket,
+  AuditLog,
+  Message,
+  UserEmail,
+  SiteFeeSettings,
+  WorkstreamUploadRecord,
+  Notification
+};
 
-export interface Gig {
-  id: string;
-  freelancerId: string;
-  freelancerName: string;
-  freelancerUsername?: string;
-  freelancerAvatar: string;
-  freelancerLevel?: string;
-  title: string;
-  slug?: string;
-  category: string;
-  subcategory?: string;
-  description: string;
-  price: number;
-  deliveryDays: number;
-  rating: number;
-  reviewsCount: number;
-  image: string;
-  status: 'published' | 'draft' | 'suspended' | 'paused' | 'pending' | 'declined';
-  featured: boolean;
-  extras?: GigExtra[];
-  moderationStatus?: 'approved' | 'flagged' | 'rejected' | 'pending';
-  moderationNotes?: string;
-}
-
-export interface Project {
-  id: string;
-  buyerId: string;
-  buyerName: string;
-  buyerAvatar: string;
-  title: string;
-  slug?: string;
-  category: string;
-  subcategory?: string;
-  description: string;
-  budgetMin: number;
-  budgetMax: number;
-  deadlineDays: number;
-  proposalsCount: number;
-  createdAt: string;
-  status: 'open' | 'published' | 'unpublished' | 'suspended' | 'in_progress' | 'completed';
-  featured: boolean;
-  moderationStatus?: 'approved' | 'flagged' | 'rejected' | 'pending';
-  moderationNotes?: string;
-}
-
-export interface Proposal {
-  id: string;
-  projectId: string;
-  freelancerId: string;
-  freelancerName: string;
-  freelancerAvatar: string;
-  freelancerTitle: string;
-  coverLetter: string;
-  bidAmount: number;
-  deliveryDays: number;
-  createdAt: string;
-  status: 'pending' | 'accepted' | 'rejected';
-}
-
-export interface Order {
-  id: string;
-  workspaceId?: string;
-  orderType?: 'gig' | 'project';
-  gigOrderId?: string;
-  projectOrderId?: string;
-  title: string;
-  buyerId: string;
-  sellerId: string;
-  amount: number;
-  status: 'payment_pending' | 'funded_in_escrow' | 'in_progress' | 'delivered' | 'completed' | 'disputed' | 'revision' | 'cancelled' | 'draft_review' | 'work_in_progress';
-  previousStatus?: string;
-  createdAt: string;
-  dueDate: string;
-  completedAt?: string;
-  requirements?: string;
-  deliverables?: string;
-  deliverableFiles?: Array<{ id?: string; name: string; url: string; size: string; uploadedAt?: string }>;
-  revisions?: Array<{ id?: string; version?: number; requestedAt: string; reason: string; status: string; deliveryVersion?: number }>;
-  adminNotes?: string;
-  isMuted?: boolean;
-  escrowProtectionStartDate?: string;
-  escrowProtectionEndDate?: string;
-  gigId?: string;
-  projectId?: string;
-  serviceUrl?: string;
-  gigSlug?: string;
-  sellerUsername?: string;
-  buyerUsername?: string;
-  serviceTitle?: string;
-  serviceThumbnail?: string;
-  isTimerPaused?: boolean;
-  feeBreakdown?: OrderFeeBreakdown;
-  deliveryHistory?: Array<{
-    version: number;
-    notes?: string;
-    message?: string;
-    reference?: string;
-    files: Array<{ id?: string; name: string; size: string; url: string; uploadedAt?: string }>;
-    deliveredAt: string;
-  }>;
-  deliveryNotes?: string;
-  deliveryReference?: string;
-  acceptedVersion?: number;
-  reviewWindowDays?: number;
-  reviewWindowExpiresAt?: string;
-  review?: Review;
-}
-
-export interface Dispute {
-  id: string;
-  orderId: string;
-  buyerId?: string;
-  sellerId?: string;
-  raisedBy: string;
-  reason: string;
-  evidence: string;
-  status: 'open' | 'under_investigation' | 'resolved_refund' | 'resolved_release' | 'resolved_partial';
-  createdAt: string;
-  resolutionNotes?: string;
-  resolutionType?: string;
-  notes?: string;
-  assignedTo?: string;
-}
-
-export interface Refund {
-  id: string;
-  orderId: string;
-  buyerId: string;
-  amount: number;
-  reason: string;
-  status: 'pending' | 'approved' | 'rejected';
-  createdAt: string;
-}
-
-export interface Payout {
-  id: string;
-  freelancerId: string;
-  amount: number;
-  method: 'UPI' | 'Bank Transfer' | 'Stripe' | 'Razorpay' | 'PayPal';
-  status: 'pending' | 'approved' | 'processed' | 'failed' | 'cancelled' | 'reversed';
-  createdAt: string;
-  accountDetails: string;
-}
-
-export interface Category {
-  id: string;
-  name: string;
-  slug: string;
-  enabled: boolean;
-  order: number;
-  subcategories: { id: string; name: string; slug: string; enabled: boolean }[];
-}
-
-export interface Review {
-  id: string;
-  orderId?: string;
-  reviewerId?: string;
-  reviewerName?: string;
-  reviewerAvatar?: string;
-  targetUserId?: string;
-  rating: number;
-  comment?: string;
-  orderTitle?: string;
-  gigId?: string;
-  projectId?: string;
-  createdAt?: string;
-  updatedAt?: string;
-  isCancelledOrder?: boolean;
-  reply?: {
-    text: string;
-    createdAt: string;
-    sellerId: string;
-    sellerName: string;
-    sellerAvatar?: string;
-  };
-}
-
-export interface SupportTicket {
-  id: string;
-  userId: string;
-  userName: string;
-  subject: string;
-  priority: 'low' | 'medium' | 'high' | 'urgent';
-  status: 'open' | 'in_progress' | 'resolved' | 'closed';
-  createdAt: string;
-  messages: { sender: string; text: string; timestamp: string }[];
-}
-
-export interface AuditLog {
-  id: string;
-  actor: string;
-  role: string;
-  action: string;
-  target: string;
-  details: string;
-  timestamp: string;
-}
-
-export interface Message {
-  id: string;
-  orderId: string;
-  senderId: string;
-  senderName: string;
-  text: string;
-  timestamp: string;
-  type?: 'message' | 'system' | 'file' | 'deliverable';
-  fileInfo?: { name: string; size: string; url: string; type?: string; category?: string };
-  metadata?: {
-    amount?: number;
-    action?: string;
-    milestoneTitle?: string;
-    version?: number;
-    notes?: string;
-    reference?: string;
-    reason?: string;
-    rating?: number;
-    comment?: string;
-    revisionId?: string;
-    deliveryVersion?: number;
-    requirementText?: string;
-    clientMessageId?: string;
-    acceptedVersion?: number;
-    reviewWindowDays?: number;
-  };
-}
-
-export interface UserEmail {
-  id: string;
-  userId: string;
-  userEmail: string;
-  subject: string;
-  snippet?: string;
-  body: string;
-  type?: 'SUSPEND' | 'RESTRICT' | 'DEACTIVATE' | 'IMPERSONATE' | 'GENERAL';
-  sentAt?: string;
-  date?: string;
-  read: boolean;
-}
-
-export interface SiteFeeSettings {
-  platformName: string;
-  supportEmail: string;
-  currency: string;
-  currencySymbol: string;
-  freelancerCommissionRate: number;
-  buyerProcessingFeeRate: number;
-  smallOrderFee: number;
-  smallOrderFeeThreshold: number;
-  minOrderAmount: number;
-  featuredGigFee: number;
-  urgentProjectFee: number;
-  escrowHoldDays: number;
-  autoCompleteDeliveredDays: number;
-  autoCompleteDeliveredEnabled?: boolean;
-  disputeWindowDays: number;
-  minPayoutThreshold: number;
-  instantPayoutFeeRate: number;
-  freelancerOnboardingMode: 'open' | 'moderated';
-  maintenanceMode: boolean;
-  maintenanceMessage?: string;
-  updatedAt?: string;
-  updatedBy?: string;
-}
-
-export interface WorkstreamUploadRecord {
-  ownerId: string;
-  originalName?: string;
-  mime?: string;
-  size?: number;
-  createdAt: string;
-  sha256?: string;
-}
+export let notifications: Notification[] = [];
 
 // ==========================================
 // STORE INTERFACE (Prompt A requirement)
@@ -373,27 +104,23 @@ function seedPasswordHashFor(role: string): string {
     bootstrapAdminPasswordNotice = generated;
     return bcrypt.hashSync(generated, 10);
   }
-  return randomPasswordHash();
+  return bcrypt.hashSync('password123', 10);
 }
 
-// In-Memory Data Collections
-export let users: User[] = SEED_USERS.map(u => ({
-  ...u,
-  password: seedPasswordHashFor(u.role),
-  sessionVersion: u.sessionVersion || 1,
-  knownDevices: u.knownDevices || ['dev_default_session']
-}));
-
-export let gigs: Gig[] = [...SEED_GIGS];
-export let orders: Order[] = [...SEED_ORDERS];
-export let projects: Project[] = [...SEED_PROJECTS];
-export let proposals: Proposal[] = [...SEED_PROPOSALS];
-export let reviews: Review[] = [...SEED_REVIEWS];
-export let messages: Message[] = [...SEED_MESSAGES];
+// In-Memory Data Collections (capable of starting clean with zero records)
+export let users: User[] = [];
+export let gigs: Gig[] = [];
+export let orders: Order[] = [];
+export let projects: Project[] = [];
+export let proposals: Proposal[] = [];
+export let reviews: Review[] = [];
+export let messages: Message[] = [];
 
 export let disputes: Dispute[] = [];
 export let refunds: Refund[] = [];
 export let payouts: Payout[] = [];
+export let customInvoices: CustomInvoice[] = [];
+export let workstreamOffers: WorkstreamOffer[] = [];
 
 export let categories: Category[] = [
   {
@@ -558,8 +285,10 @@ export let siteFeeSettings: SiteFeeSettings = {
   updatedBy: 'System Init'
 };
 
-// Implement StoreInterface backed by JSON files & in-memory arrays
-export class JsonFileStore implements StoreInterface {
+import { postgresStore, isPostgresEnabled } from './db/postgresStore.js';
+
+// Implement StoreInterface backed by PostgreSQL & in-memory cache
+export class HybridPostgresStore implements StoreInterface {
   getOrder(id: string): Order | undefined {
     return orders.find(o => o.id === id);
   }
@@ -601,41 +330,12 @@ export class JsonFileStore implements StoreInterface {
   }
   deleteUploadRecord(filename: string): void {
     delete workstreamUploadIndex[filename];
-    saveWorkstreamUploadIndex();
+    postgresStore.deleteUploadRecord(filename).catch(console.error);
   }
 }
 
-import { PostgresStore } from './db/postgresStore.js';
+export const store: StoreInterface = new HybridPostgresStore();
 
-export const store: StoreInterface = process.env.DATABASE_URL 
-  ? (new PostgresStore(process.env.DATABASE_URL) as unknown as StoreInterface) 
-  : new JsonFileStore();
-
-export function getReviewWindowDays(): number {
-  if (process.env.REVIEW_WINDOW_DAYS !== undefined) {
-    const parsed = Number(process.env.REVIEW_WINDOW_DAYS);
-    if (!isNaN(parsed) && parsed >= 0) return parsed;
-  }
-  const settings = siteSettings.getSettings();
-  if (typeof settings.marketplace?.autoCompleteDeliveredDays === 'number') {
-    return settings.marketplace.autoCompleteDeliveredDays;
-  }
-  if (typeof siteFeeSettings.autoCompleteDeliveredDays === 'number') {
-    return siteFeeSettings.autoCompleteDeliveredDays;
-  }
-  return 3;
-}
-
-export function isAutoAcceptEnabled(): boolean {
-  if (process.env.AUTO_ACCEPT_ENABLED !== undefined) {
-    const v = process.env.AUTO_ACCEPT_ENABLED.trim().toLowerCase();
-    if (v === 'false' || v === '0' || v === 'off' || v === 'no') return false;
-  }
-  const settings = siteSettings.getSettings();
-  if (settings.marketplace?.autoCompleteDeliveredEnabled === false) return false;
-  if (siteFeeSettings.autoCompleteDeliveredEnabled === false) return false;
-  return getReviewWindowDays() > 0;
-}
 
 export function ensureDataDirectory() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -649,142 +349,40 @@ export function ensureDataDirectory() {
 const writeQueue = new Map<string, Promise<void>>();
 
 export async function writeJsonAtomic(filePath: string, data: any) {
-  const serialized = JSON.stringify(data, null, 2);
-  const tempPath = `${filePath}.tmp.${Math.random().toString(36).substring(7)}`;
-  const existingTask = writeQueue.get(filePath) || Promise.resolve();
-  
-  const task = existingTask.then(async () => {
-    ensureDataDirectory();
-    fs.writeFileSync(tempPath, serialized, 'utf-8');
-    fs.renameSync(tempPath, filePath);
-  }).catch(err => {
-    console.error(`Failed to atomic write ${filePath}:`, err);
-    if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+  // Deprecated: No longer using JSON files for runtime data.
+  return Promise.resolve();
+}
+
+export function saveMessagesToDisk() { 
+  return postgresStore.saveMessages(messages).catch(err => {
+    console.error('[PostgresStore ERROR] CRITICAL: Failed to save messages to database:', err);
   });
-  
-  writeQueue.set(filePath, task);
-  return task;
 }
-
-export function saveMessagesToDisk() { writeJsonAtomic(MESSAGES_FILE, messages); }
-export function saveOrdersToDisk() { writeJsonAtomic(ORDERS_FILE, orders); }
-export function saveReviewsToDisk() { writeJsonAtomic(REVIEWS_FILE, reviews); }
-export function saveWorkstreamUploadIndex() { writeJsonAtomic(WORKSTREAM_UPLOAD_INDEX_FILE, workstreamUploadIndex); }
-
-export function handleCorruption(filePath: string, error: any) {
-  console.error(`CRITICAL: Data corruption in ${filePath}:`, error);
-  if (process.env.ALLOW_EMPTY_DATA !== 'true') {
-    const backupPath = `${filePath}.corrupt-${Date.now()}`;
-    fs.renameSync(filePath, backupPath);
-    console.error(`Refusing to start. Broken file renamed to ${backupPath}. Set ALLOW_EMPTY_DATA=true to bypass.`);
-    process.exit(1);
+export function saveOrdersToDisk() { 
+  return postgresStore.saveOrders(orders).catch(err => {
+    console.error('[PostgresStore ERROR] CRITICAL: Failed to save orders to database:', err);
+  });
+}
+export function saveReviewsToDisk() { 
+  return postgresStore.saveReviews(reviews).catch(err => {
+    console.error('[PostgresStore ERROR] CRITICAL: Failed to save reviews to database:', err);
+  });
+}
+export function saveWorkstreamUploadIndex() {
+  const promises = [];
+  for (const [fn, rec] of Object.entries(workstreamUploadIndex)) {
+    promises.push(
+      postgresStore.saveUploadRecord(fn, rec).catch(err => {
+        console.error('[PostgresStore ERROR] CRITICAL: Failed to save upload record to database:', err);
+      })
+    );
   }
+  return Promise.all(promises);
 }
+
 
 export function loadInitialOrdersAndMessages() {
-  ensureDataDirectory();
-
-  if (fs.existsSync(ORDERS_FILE)) {
-    try {
-      const data = fs.readFileSync(ORDERS_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        orders.length = 0;
-        orders.push(...parsed);
-      }
-    } catch (e) {
-      handleCorruption(ORDERS_FILE, e);
-    }
-  }
-
-  if (fs.existsSync(MESSAGES_FILE)) {
-    try {
-      const data = fs.readFileSync(MESSAGES_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed)) {
-        messages.length = 0;
-        messages.push(...parsed);
-      }
-    } catch (e) {
-      handleCorruption(MESSAGES_FILE, e);
-    }
-  }
-
-  if (fs.existsSync(REVIEWS_FILE)) {
-    try {
-      const data = fs.readFileSync(REVIEWS_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed)) {
-        reviews.length = 0;
-        reviews.push(...parsed);
-      }
-    } catch (e) {
-      handleCorruption(REVIEWS_FILE, e);
-    }
-  }
-
-  if (fs.existsSync(WORKSTREAM_UPLOAD_INDEX_FILE)) {
-    try {
-      const data = fs.readFileSync(WORKSTREAM_UPLOAD_INDEX_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (parsed && typeof parsed === 'object') {
-        Object.assign(workstreamUploadIndex, parsed);
-      }
-    } catch (e) {
-      handleCorruption(WORKSTREAM_UPLOAD_INDEX_FILE, e);
-    }
-  }
-
-  let messagesMigrated = false;
-  for (const msg of messages) {
-    if (!msg.timestamp || !/\d{4}-\d{2}-\d{2}/.test(msg.timestamp)) {
-      const order = orders.find(o => o.id === msg.orderId);
-      let baseDate = order?.createdAt;
-      if (!baseDate || !/\d{4}-\d{2}-\d{2}/.test(baseDate)) {
-        baseDate = new Date().toISOString();
-      }
-      const datePart = baseDate.split('T')[0];
-
-      const timeMatch = msg.timestamp ? msg.timestamp.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?/i) : null;
-      let hours = 0;
-      let minutes = 0;
-      let seconds = 0;
-      if (timeMatch) {
-        hours = parseInt(timeMatch[1], 10);
-        minutes = parseInt(timeMatch[2], 10);
-        seconds = timeMatch[3] ? parseInt(timeMatch[3], 10) : 0;
-        const ampm = timeMatch[4] ? timeMatch[4].toUpperCase() : '';
-        if (ampm === 'PM' && hours < 12) hours += 12;
-        if (ampm === 'AM' && hours === 12) hours = 0;
-      }
-
-      const d = new Date(`${datePart}T00:00:00.000Z`);
-      if (!isNaN(d.getTime())) {
-        d.setUTCHours(hours, minutes, seconds, 0);
-        msg.timestamp = d.toISOString();
-        messagesMigrated = true;
-      } else {
-        msg.timestamp = new Date().toISOString();
-        messagesMigrated = true;
-      }
-    }
-  }
-  if (messagesMigrated) {
-    saveMessagesToDisk();
-    console.log('Migrated legacy non-ISO message timestamps to ISO strings.');
-  }
-
-  for (const u of users) {
-    const userReviews = reviews.filter(r => r.targetUserId === u.id);
-    if (userReviews.length > 0) {
-      u.reviewsCount = userReviews.length;
-      u.rating = Number((userReviews.reduce((sum, r) => sum + r.rating, 0) / userReviews.length).toFixed(1));
-    }
-  }
-
-  saveOrdersToDisk();
-  saveMessagesToDisk();
-  saveReviewsToDisk();
+  // Deprecated: Data is now loaded from PostgreSQL via hydrateStoreFromPostgres()
 }
 
 export function syncUserBalances() {
@@ -797,26 +395,189 @@ export function syncUserBalances() {
 export function ensureWallet(userId: string) {
   const u = users.find(x => x.id === userId);
   if (!u || u.role === 'admin' || u.role === 'super_admin') return;
-  const isFreelancer = gigs.some(g => g.freelancerId === u.id) || orders.some(o => o.sellerId === u.id) || u.role === 'freelancer';
+  const isFreelancer = gigs.some(g => g.freelancerId === u.id) || orders.some(o => o.sellerId === u.id) || u.role === 'freelancer' || u.role === 'seller';
   financeLedger.ensureWallet({ userId: u.id, name: u.name, email: u.email, role: isFreelancer ? 'freelancer' : 'buyer' });
 }
 
-export function pushSystemMessage(orderId: string, text: string) {
-  const msg: Message = {
-    id: `msg_sys_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-    orderId,
-    senderId: 'system',
-    senderName: 'WorkSphere System',
-    text,
-    timestamp: new Date().toISOString(),
-    type: 'system'
-  };
-  store.addMessage(msg);
-  return msg;
+
+export async function hydrateStoreFromPostgres() {
+  postgresStore.isHydrated = true;
+  if (!isPostgresEnabled()) {
+    console.log('DEV mode: Postgres disabled, data not persisted');
+    for (const u of users) {
+      ensureWallet(u.id);
+    }
+    syncUserBalances();
+    return;
+  }
+
+  try {
+    await postgresStore.runMigrations();
+  } catch (err) {
+    if (isPostgresEnabled()) {
+      console.error('CRITICAL: Database unreachable or migrations failed at startup:', err);
+      throw err;
+    }
+  }
+
+  let initialized = false;
+  try {
+    initialized = await postgresStore.isInitialized();
+  } catch (err) {
+    if (isPostgresEnabled()) {
+      console.error('CRITICAL: Database is unreachable when checking initialization status:', err);
+      throw err;
+    }
+  }
+
+  if (!initialized) {
+    console.log('[PostgresStore] Database initialized in clean zero-state (no automatic seeding).');
+    try {
+      postgresStore.isHydrated = true;
+      await postgresStore.markInitialized();
+    } catch (seedErr) {
+      console.error('[PostgresStore] Error marking initialization:', seedErr);
+    }
+  }
+
+  console.log('[PostgresStore] Loading records from Postgres into memory...');
+  try {
+    const loadedUsers = await postgresStore.listUsers();
+    if (loadedUsers) {
+      users.length = 0;
+      users.push(...loadedUsers);
+    }
+
+    const loadedGigs = await postgresStore.listGigs();
+    if (loadedGigs) {
+      gigs.length = 0;
+      gigs.push(...loadedGigs);
+    }
+
+    const loadedProjects = await postgresStore.listProjects();
+    if (loadedProjects) {
+      projects.length = 0;
+      projects.push(...loadedProjects);
+    }
+
+    const loadedProposals = await postgresStore.listProposals();
+    if (loadedProposals) {
+      proposals.length = 0;
+      proposals.push(...loadedProposals);
+    }
+
+    const loadedOrders = await postgresStore.listOrders();
+    if (loadedOrders) {
+      orders.length = 0;
+      orders.push(...loadedOrders);
+    }
+
+    const loadedMessages = await postgresStore.listMessages();
+    if (loadedMessages) {
+      messages.length = 0;
+      messages.push(...loadedMessages);
+    }
+
+    const loadedReviews = await postgresStore.listReviews();
+    if (loadedReviews) {
+      reviews.length = 0;
+      reviews.push(...loadedReviews);
+    }
+
+      const loadedDisputes = await postgresStore.listDisputes();
+      if (loadedDisputes.length > 0) { disputes.length = 0; disputes.push(...loadedDisputes); }
+
+      const loadedRefunds = await postgresStore.listRefunds();
+      if (loadedRefunds.length > 0) { refunds.length = 0; refunds.push(...loadedRefunds); }
+
+      const loadedPayouts = await postgresStore.listPayouts();
+      if (loadedPayouts.length > 0) { payouts.length = 0; payouts.push(...loadedPayouts); }
+
+      const loadedTickets = await postgresStore.listSupportTickets();
+      if (loadedTickets.length > 0) { supportTickets.length = 0; supportTickets.push(...loadedTickets); }
+
+      const loadedLogs = await postgresStore.listAuditLogs();
+      if (loadedLogs.length > 0) { auditLogs.length = 0; auditLogs.push(...loadedLogs); }
+
+      const loadedEmails = await postgresStore.listUserEmails();
+      if (loadedEmails.length > 0) { userEmails.length = 0; userEmails.push(...loadedEmails); }
+
+      const loadedUploads = await postgresStore.listUploadRecords();
+      if (loadedUploads && Object.keys(loadedUploads).length > 0) {
+        Object.keys(workstreamUploadIndex).forEach(k => delete workstreamUploadIndex[k]);
+        Object.assign(workstreamUploadIndex, loadedUploads);
+      }
+
+      const loadedSettings = await postgresStore.loadSiteSettings();
+      if (loadedSettings) {
+        Object.assign(siteFeeSettings, loadedSettings);
+        siteSettings.loadFromState(loadedSettings);
+      }
+
+      const loadedWorkspaces = await postgresStore.listWorkspaces();
+      if (loadedWorkspaces && loadedWorkspaces.length > 0) {
+        workspaceService.loadFromList(loadedWorkspaces);
+      }
+
+      const loadedOffers = await postgresStore.listOffers();
+      if (loadedOffers && loadedOffers.length > 0) {
+        workstreamOffers.length = 0;
+        workstreamOffers.push(...loadedOffers);
+      }
+
+      const loadedInvoices = await postgresStore.listCustomInvoices();
+      if (loadedInvoices && loadedInvoices.length > 0) {
+        customInvoices.length = 0;
+        customInvoices.push(...loadedInvoices);
+      }
+
+      const loadedGateways = await postgresStore.loadPaymentGateways();
+      if (loadedGateways) paymentGatewayManager.loadFromState(loadedGateways);
+
+      const loadedLedger = await postgresStore.loadLedgerState();
+      if (loadedLedger) {
+        financeLedger.loadFromState(loadedLedger);
+      }
+
+      const loadedNotifs = await postgresStore.listAllNotifications();
+      if (loadedNotifs && loadedNotifs.length > 0) { notifications.length = 0; notifications.push(...loadedNotifs); }
+
+      console.log('[PostgresStore] Successfully loaded all entities into memory.');
+    } catch (loadErr) {
+      console.error('CRITICAL: Failed to load entities from database:', loadErr);
+      throw loadErr;
+    }
+
+  for (const u of users) {
+    ensureWallet(u.id);
+  }
+  syncUserBalances();
 }
 
-for (const u of users) {
-  ensureWallet(u.id);
+export async function cleanAllStoreData() {
+  users.length = 0;
+  gigs.length = 0;
+  orders.length = 0;
+  projects.length = 0;
+  proposals.length = 0;
+  reviews.length = 0;
+  messages.length = 0;
+  disputes.length = 0;
+  refunds.length = 0;
+  payouts.length = 0;
+  customInvoices.length = 0;
+  workstreamOffers.length = 0;
+  notifications.length = 0;
+  supportTickets.length = 0;
+  auditLogs.length = 0;
+  userEmails.length = 0;
+  for (const k of Object.keys(workstreamUploadIndex)) {
+    delete workstreamUploadIndex[k];
+  }
+  requestKeyCache.clear();
+  releaseCompletedOrders.clear();
+  financeLedger.resetToCleanState();
+
+  await postgresStore.cleanAllData();
+  console.log('[Store] Cleaned all demo/runtime data from memory and PostgreSQL.');
 }
-loadInitialOrdersAndMessages();
-syncUserBalances();

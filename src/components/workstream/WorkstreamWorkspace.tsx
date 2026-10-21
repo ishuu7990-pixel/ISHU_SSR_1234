@@ -426,7 +426,7 @@ export const WorkstreamWorkspace: React.FC<WorkstreamWorkspaceProps> = ({
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
         {/* LEFT COLUMN: ACTIVITY & FILES TABS (3 COLS) */}
         <div className="lg:col-span-3 space-y-6">
-          <div className="bg-white border border-slate-200 rounded-3xl shadow-xs overflow-hidden flex flex-col h-[750px]">
+          <div className="bg-white border border-slate-200 rounded-3xl shadow-xs overflow-hidden flex flex-col h-auto">
             {/* SUBTABS HEADER */}
             <div className="flex border-b border-slate-100 bg-slate-50/70 px-6 py-2 items-center justify-between">
               <div className="flex gap-4">
@@ -461,10 +461,11 @@ export const WorkstreamWorkspace: React.FC<WorkstreamWorkspaceProps> = ({
             </div>
 
             {/* TAB CONTENT */}
-            <div className="flex-1 overflow-hidden flex flex-col relative">
+            <div className="flex flex-col relative">
               {activeSubTab === 'activity' ? (
                 <>
                   <WorkstreamActivityStream
+                    order={order}
                     messages={messages}
                     currentUserId={currentUser?.id}
                     usersList={usersList}
@@ -481,6 +482,12 @@ export const WorkstreamWorkspace: React.FC<WorkstreamWorkspaceProps> = ({
                     onRequestRevisionFromInvoice={() => setIsRevisionModalOpen(true)}
                     onReplyReview={handleReplyReview}
                     onRetryMessage={onRetryMessage}
+                    onOpenDeliverModal={() => setIsDeliverModalOpen(true)}
+                    onOpenReleaseModal={() => setIsReleaseModalOpen(true)}
+                    onOpenRevisionModal={() => setIsRevisionModalOpen(true)}
+                    onOpenReviewModal={() => setIsReviewModalOpen(true)}
+                    onOpenDisputeModal={() => setIsDisputeModalOpen(true)}
+                    onStartVideoCall={() => setIsVideoCallModalOpen(true)}
                   />
                   <WorkstreamMessageInput
                     key={order.id}

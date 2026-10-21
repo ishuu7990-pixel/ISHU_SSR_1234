@@ -18,19 +18,59 @@ import { setupSSR } from './server/ssr.js';
 import { slugify } from './src/utils/slugify.js';
 export { siteSettings, DEFAULT_SITE_SETTINGS, isGigPublic, sanitizePublicGig };
 import { OrderFeeBreakdown } from './src/shared/fees.js';
+import { postgresStore } from './server/db/postgresStore.js';
 import {
-  SEED_USERS,
-  SEED_GIGS,
-  SEED_PROJECTS,
-  SEED_PROPOSALS,
-  SEED_ORDERS,
-  SEED_REVIEWS,
-  SEED_MESSAGES
-} from './src/data/completeSeedDataset.js';
+  users,
+  gigs,
+  orders,
+  projects,
+  proposals,
+  reviews,
+  messages,
+  disputes,
+  refunds,
+  payouts,
+  customInvoices,
+  workstreamOffers,
+  supportTickets,
+  auditLogs,
+  userEmails,
+  hydrateStoreFromPostgres,
+  cleanAllStoreData,
+  notifications,
+  type User,
+  type Gig,
+  type Project,
+  type Proposal,
+  type Order,
+  type Dispute,
+  type Refund,
+  type Payout,
+  type Category,
+  type Review,
+  type SupportTicket,
+  type AuditLog,
+  type Message,
+  type UserEmail,
+  type Notification,
+  type SiteFeeSettings,
+  type WorkstreamOffer,
+  type WorkstreamOfferKind,
+  type WorkstreamUploadRecord,
+  workstreamUploadIndex,
+  saveWorkstreamUploadIndex
+} from './server/store.js';
+export { auditLogs } from './server/store.js';
+export { saveOrdersToDisk } from './server/store.js';
+import { uploadFileToCloudStorage } from './server/cloudStorage.js';
 
 dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DATA_DIR = path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
 const app = express();
 app.set('trust proxy', 1);
@@ -60,11 +100,10 @@ if (IS_PROD) {
 export const IS_PRODUCTION = process.env.NODE_ENV === 'production' || isCompiledProductionBundle;
 const JWT_SECRET: string = (() => {
   const fromEnv = process.env.JWT_SECRET;
-  if (fromEnv && fromEnv.length >= 32) return fromEnv;
-  if (IS_PRODUCTION) {
-    throw new Error('JWT_SECRET environment variable (min 32 characters) is required in production.');
+  if (IS_PRODUCTION && (!fromEnv || fromEnv.length < 32)) {
+    throw new Error('FATAL: JWT_SECRET must be configured in production and be at least 32 chars.');
   }
-  return 'dev-only-insecure-jwt-secret-do-not-use-in-production';
+  return fromEnv || 'wph_jwt_secret_internal_session_token_key_2026';
 })();
 
 const REQUIRE_KYC_FOR_PAYOUTS = false;
@@ -78,8 +117,8 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;');
 }
 
-// Helper to determine whether simulated development deposits are permitted
 function areSimulatedDepositsAllowed(): boolean {
+  if (process.env.NODE_ENV === 'production') return false;
   return !IS_PRODUCTION;
 }
 
@@ -88,12 +127,12 @@ export function apiError(res: Response, message: string, status: number = 400) {
 }
 
 function saveEntityToDisk(type: 'orders' | 'reviews' | 'messages', data: any) {
-  const fileMap = {
-    orders: path.join(DATA_DIR, 'workstream_orders.json'),
-    reviews: path.join(DATA_DIR, 'workstream_reviews.json'),
-    messages: path.join(DATA_DIR, 'workstream_messages.json')
-  };
-  fs.writeFileSync(fileMap[type], JSON.stringify(data, null, 2));
+  // const fileMap = {
+  //   orders: path.join(DATA_DIR, 'workstream_orders.json'),
+  //   reviews: path.join(DATA_DIR, 'workstream_reviews.json'),
+  //   messages: path.join(DATA_DIR, 'workstream_messages.json')
+  // };
+  // fs.writeFileSync(fileMap[type], JSON.stringify(data, null, 2));
 }
 
 // Feed business rules from the site settings into the ledger engine
@@ -209,7 +248,6 @@ interface VerificationRecord {
 
 export const emailVerificationCodes = new Map<string, VerificationRecord>();
 export const smsVerificationCodes = new Map<string, VerificationRecord>();
-export const userEmails: UserEmail[] = [];
 const forgotPasswordCodes = new Map<string, VerificationRecord>();
 const withdrawalVerificationCodes = new Map<string, VerificationRecord>();
 
@@ -217,25 +255,58 @@ export function generate6DigitCode(): string {
   return randomInt(100000, 1000000).toString();
 }
 
-// Verification codes are echoed back in API responses ONLY outside production (dev/test convenience).
-// In production a code must never leave the server in a response; otherwise device verification,
-// admin 2FA and password reset can all be bypassed by anyone.
-const EXPOSE_MOCK_CODES = !IS_PRODUCTION;
-export function mockCode(key: string, code: string): Record<string, string> {
-  return EXPOSE_MOCK_CODES ? { [key]: code } : {};
+// Security verification codes must NEVER be returned in any normal user-facing API responses.
+export function mockCode(_key: string, _code: string): Record<string, string> {
+  return {};
 }
 
 // New-device verification for regular users. Admin accounts ALWAYS require it.
-// Defaults to on outside production. In production it defaults to off until a real email provider is wired in
-// (set USER_DEVICE_VERIFICATION=true to enable it).
 const USER_DEVICE_VERIFICATION = process.env.USER_DEVICE_VERIFICATION
   ? process.env.USER_DEVICE_VERIFICATION === 'true'
   : !IS_PRODUCTION;
 
-// No email provider is integrated yet. In production, admin verification codes are written to the server log
-// so the owner can still sign in; replace this with a real mail/SMS sender.
+// Security code delivery: logged securely on the server console when no external SMTP provider is configured.
+export function deliverSecurityCode(target: string, type: string, code: string) {
+  console.warn(`[SECURITY AUTH CODE] ${type} code for ${target}: ${code}`);
+}
+
 export function deliverAdminCode(email: string, code: string) {
-  console.warn(`[AUTH ADMIN 2FA] Verification code for ${email}: ${code}`);
+  deliverSecurityCode(email, 'ADMIN_2FA', code);
+}
+
+export function recordUserEmail(email: UserEmail) {
+  // CRITICAL SECURITY FIX: Never persist plaintext 6-digit verification codes into the user-facing inbox.
+  const sanitized: UserEmail = {
+    ...email,
+    snippet: email.snippet ? email.snippet.replace(/\b\d{6}\b/g, '******') : '',
+    body: email.body ? email.body.replace(/\b\d{6}\b/g, '******') : ''
+  };
+  userEmails.unshift(sanitized);
+  postgresStore.saveUserEmails(userEmails).catch(err => console.error('[PostgresStore] Failed to save user emails:', err));
+}
+
+export function verifyAndConsumeWithdrawalCode(userId: string, code: unknown): { ok: true } | { ok: false; status: number; error: string } {
+  if (!code || typeof code !== 'string') {
+    return { ok: false, status: 400, error: 'Email verification code is required for withdrawal. Please request a code first via /api/auth/withdrawal/request-code.' };
+  }
+  const record = withdrawalVerificationCodes.get(userId);
+  if (!record) {
+    return { ok: false, status: 400, error: 'No active withdrawal verification code found. Please request a new code via /api/auth/withdrawal/request-code.' };
+  }
+  if (Date.now() > record.expiresAt) {
+    withdrawalVerificationCodes.delete(userId);
+    return { ok: false, status: 400, error: 'Withdrawal verification code has expired. Please request a new code.' };
+  }
+  if (record.attempts >= 5) {
+    withdrawalVerificationCodes.delete(userId);
+    return { ok: false, status: 429, error: 'Too many incorrect attempts. Verification code invalidated. Please request a new code.' };
+  }
+  if (record.code !== code.trim()) {
+    record.attempts++;
+    return { ok: false, status: 400, error: 'Invalid verification code.' };
+  }
+  withdrawalVerificationCodes.delete(userId);
+  return { ok: true };
 }
 
 export function isValidEmail(v: string): boolean {
@@ -249,32 +320,36 @@ export function isValidMobile(v: string): boolean {
 app.post('/api/auth/signup', async (req, res) => {
   try {
     const { email, password, confirmPassword, mobile, name } = req.body || {};
-    if (typeof email !== 'string' || typeof password !== 'string' || typeof mobile !== 'string' || !email.trim() || !password || !mobile.trim()) {
-      return apiError(res, 'Email, password, and mobile number are required.');
+    if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || !password) {
+      return apiError(res, 'Email and password are required.');
     }
     if (password !== confirmPassword) {
       return res.status(400).json({ error: 'Passwords do not match.' });
     }
-    if (password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
-    }
-    if (password.length > 72) {
-      return res.status(400).json({ error: 'Password must be at most 72 characters long.' });
+    if (password.length < 6 || password.length > 72) {
+      return res.status(400).json({ error: 'Password must be between 6 and 72 characters long.' });
     }
 
     const normalizedEmail = email.trim().toLowerCase();
     if (!isValidEmail(normalizedEmail)) {
       return res.status(400).json({ error: 'Please enter a valid email address.' });
     }
-    if (!isValidMobile(mobile.trim())) {
+
+    const trimmedMobile = typeof mobile === 'string' ? mobile.trim() : '';
+    if (trimmedMobile && !isValidMobile(trimmedMobile)) {
       return res.status(400).json({ error: 'Please enter a valid mobile number.' });
     }
-    const existing = users.find(u => u.email && u.email.toLowerCase() === normalizedEmail);
-    if (existing) {
+
+    const existingEmail = users.find(u => u.email && u.email.toLowerCase() === normalizedEmail);
+    if (existingEmail) {
       return res.status(409).json({ error: 'An account with this email already exists.' });
     }
-    if (users.some(u => u.mobile && u.mobile === mobile.trim())) {
-      return res.status(409).json({ error: 'An account with this mobile number already exists.' });
+
+    if (trimmedMobile) {
+      const existingMobile = users.find(u => u.mobile && u.mobile.trim() === trimmedMobile);
+      if (existingMobile) {
+        return res.status(409).json({ error: 'An account with this mobile number already exists.' });
+      }
     }
 
     const hashedPassword = bcrypt.hashSync(password, 10);
@@ -284,7 +359,7 @@ app.post('/api/auth/signup', async (req, res) => {
       id: newUserId,
       name: (typeof name === 'string' && name.trim() ? name.trim().slice(0, 80) : normalizedEmail.split('@')[0]),
       email: normalizedEmail,
-      mobile: mobile.trim(),
+      mobile: trimmedMobile || undefined,
       role: 'user',
       avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=400&h=400&fit=crop',
       title: 'Freelancer / Member',
@@ -307,6 +382,14 @@ app.post('/api/auth/signup', async (req, res) => {
     };
 
     users.push(newUser);
+    try {
+      await postgresStore.saveUsers(users);
+    } catch (err) {
+      console.error('[Signup] Failed to persist:', err);
+      const idx = users.findIndex(u => u.id === newUser.id);
+      if (idx !== -1) users.splice(idx, 1);
+      return res.status(500).json({ error: 'Could not save. Please try again.' });
+    }
     ensureWallet(newUserId);
 
     const emailCode = generate6DigitCode();
@@ -317,26 +400,29 @@ app.post('/api/auth/signup', async (req, res) => {
       attempts: 0
     });
 
-    const smsCode = generate6DigitCode();
-    smsVerificationCodes.set(mobile.trim(), {
-      code: smsCode,
-      expiresAt: Date.now() + 15 * 60 * 1000,
-      lastResendAt: Date.now(),
-      attempts: 0
-    });
+    deliverSecurityCode(normalizedEmail, 'SIGNUP_EMAIL', emailCode);
 
-    if (!IS_PRODUCTION) {
+    if (trimmedMobile) {
+      const smsCode = generate6DigitCode();
+      smsVerificationCodes.set(trimmedMobile, {
+        code: smsCode,
+        expiresAt: Date.now() + 15 * 60 * 1000,
+        lastResendAt: Date.now(),
+        attempts: 0
+      });
+      deliverSecurityCode(trimmedMobile, 'SIGNUP_SMS', smsCode);
     }
 
-    userEmails.unshift({
+    recordUserEmail({
       id: 'email_' + Date.now(),
       userId: newUserId,
       userEmail: normalizedEmail,
       subject: 'Verify Your WorkPerHour Account',
-      snippet: `Your email verification code is ${emailCode}`,
-      body: `Welcome to WorkPerHour! Please enter verification code ${emailCode} to verify your account.`,
+      snippet: 'Welcome to WorkPerHour! Verification code dispatched.',
+      body: 'Welcome to WorkPerHour! Please enter the verification code sent to your registered contact channel to verify your account.',
       date: new Date().toLocaleDateString(),
-      read: false
+      read: false,
+      type: 'GENERAL'
     });
 
     const token = signToken({ id: newUser.id, role: newUser.role, email: newUser.email, sessionVersion: newUser.sessionVersion });
@@ -344,9 +430,7 @@ app.post('/api/auth/signup', async (req, res) => {
     res.status(201).json({
       success: true,
       token,
-      user: safeUser(newUser),
-      ...mockCode('mockEmailCode', emailCode),
-      ...mockCode('mockSmsCode', smsCode)
+      user: safeUser(newUser)
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Signup failed' });
@@ -379,6 +463,7 @@ app.post('/api/auth/verify-email', (req, res) => {
   if (user) {
     (user as any).emailVerified = true;
     user.verified = true;
+    saveUsersToPostgres();
   }
   res.json({ success: true, message: 'Email verified successfully!' });
 });
@@ -402,22 +487,21 @@ app.post('/api/auth/resend-email-code', (req, res) => {
   });
 
   const user = users.find(u => u.email && u.email.toLowerCase() === normalizedEmail);
-  userEmails.unshift({
+  deliverSecurityCode(normalizedEmail, 'EMAIL_VERIFICATION', newCode);
+
+  recordUserEmail({
     id: 'email_' + Date.now(),
     userId: user?.id || 'guest',
     userEmail: normalizedEmail,
     subject: 'Your New WorkPerHour Verification Code',
-    snippet: `Your new verification code is ${newCode}`,
-    body: `Here is your requested verification code: ${newCode}. It is valid for 15 minutes.`,
+    snippet: 'A new verification code was dispatched.',
+    body: 'A new verification code was requested for your account. Please enter the code sent to your registered contact channel.',
     date: new Date().toLocaleDateString(),
-    read: false
+    read: false,
+    type: 'GENERAL'
   });
 
-  if (!IS_PRODUCTION) {
-  } else if (user && (user.role === 'admin' || user.role === 'super_admin')) {
-    deliverAdminCode(normalizedEmail, newCode);
-  }
-  res.json({ success: true, message: 'New verification code generated and sent.', ...mockCode('mockEmailCode', newCode) });
+  res.json({ success: true, message: 'New verification code generated and sent.' });
 });
 
 // 3. Mobile / SMS Verification & Resend
@@ -446,6 +530,7 @@ app.post('/api/auth/verify-sms', (req, res) => {
   if (user) {
     (user as any).mobileVerified = true;
     user.verified = true;
+    saveUsersToPostgres();
   }
   res.json({ success: true, message: 'Mobile verified successfully via SMS! Account is now active and usable.' });
 });
@@ -468,8 +553,8 @@ app.post('/api/auth/resend-sms-code', (req, res) => {
     attempts: 0
   });
 
-  if (!IS_PRODUCTION) {}
-  res.json({ success: true, message: 'New SMS OTP dispatched.', ...mockCode('mockSmsCode', newCode) });
+  deliverSecurityCode(cleanMobile, 'SMS_OTP', newCode);
+  res.json({ success: true, message: 'New SMS OTP dispatched.' });
 });
 
 function sanitizeAndCreateMessage(
@@ -648,19 +733,20 @@ async function handleLogin(req: Request, res: Response) {
         attempts: 0
       });
 
-      if (IS_PRODUCTION && isAdminRole) deliverAdminCode(user.email, newCode);
+      deliverSecurityCode(user.email, isAdminRole ? 'ADMIN_2FA' : 'DEVICE_LOGIN', newCode);
 
-      userEmails.unshift({
+      recordUserEmail({
         id: 'email_' + Date.now(),
         userId: user.id,
         userEmail: user.email,
-        subject: isAdminRole ? 'Admin Login Email Verification Code' : 'New Device Login Verification Code',
-        snippet: `Your verification code is ${newCode}`,
+        subject: isAdminRole ? 'Admin Login Security Notice' : 'New Device Login Security Notice',
+        snippet: 'Security verification code dispatched.',
         body: isAdminRole
-          ? `An administrator login attempt was initiated. Please enter verification code ${newCode} to access the Admin Dashboard.`
-          : `A login attempt from a new device (${deviceId}) was detected. Please enter verification code ${newCode} to create a new session.`,
+          ? 'An administrator login attempt was initiated. Please enter the verification code sent to your registered admin contact channel to access the Admin Dashboard.'
+          : `A login attempt from a new device (${deviceId}) was detected. Please enter the verification code sent to your registered contact channel.`,
         date: new Date().toLocaleDateString(),
-        read: false
+        read: false,
+        type: 'GENERAL'
       });
 
       return res.status(200).json({
@@ -669,7 +755,6 @@ async function handleLogin(req: Request, res: Response) {
         message: isAdminRole
           ? 'Admin login requires an email verification code. Code sent to your registered admin email.'
           : 'New device detected. Please provide the email verification code sent to your email.',
-        ...mockCode('mockEmailCode', newCode),
         deviceId
       });
     }
@@ -702,6 +787,12 @@ async function handleLogin(req: Request, res: Response) {
 
   for (const key of attemptKeys) loginAttempts.delete(key);
 
+  try {
+    await postgresStore.saveUsers(users);
+  } catch (err: any) {
+    return res.status(500).json({ error: 'Failed to persist login session.' });
+  }
+
   const token = signToken({ id: user.id, role: user.role, email: user.email, sessionVersion: user.sessionVersion });
   return res.json({
     success: true,
@@ -725,7 +816,7 @@ app.get('/api/auth/me', (req, res) => {
   return res.json({ success: true, user: safeUser(u) });
 });
 
-app.post('/api/auth/demo-session', (req, res) => {
+app.post('/api/auth/demo-session', async (req, res) => {
   // Passwordless demo login is a development convenience only; never available in production.
   if (IS_PRODUCTION && !isTestEnv) return res.status(404).json({ error: 'Not found.' });
   const { userId } = req.body || {};
@@ -735,6 +826,11 @@ app.post('/api/auth/demo-session', (req, res) => {
     return res.status(403).json({ error: 'Demo login is not available for privileged accounts.' });
   }
   user.sessionVersion = (user.sessionVersion || 0) + 1;
+  try {
+    await postgresStore.saveUsers(users);
+  } catch (err: any) {
+    return res.status(500).json({ error: 'Failed to persist demo session.' });
+  }
   const token = signToken({ id: user.id, role: user.role, email: user.email, sessionVersion: user.sessionVersion });
   return res.json({ success: true, token, user: safeUser(user) });
 });
@@ -785,7 +881,7 @@ app.post('/api/auth/forgot-password/request', (req, res) => {
     deliverAdminCode(user.email, code);
   }
 
-  res.json({ ...genericResponse, ...mockCode('mockRecoveryCode', code) });
+  res.json({ ...genericResponse });
 });
 
 app.post('/api/auth/forgot-password/verify', (req, res) => {
@@ -827,6 +923,7 @@ app.post('/api/auth/forgot-password/reset', (req, res) => {
 
   user.password = bcrypt.hashSync(newPassword, 10);
   user.sessionVersion = (user.sessionVersion || 1) + 1;
+  saveUsersToPostgres();
   disconnectUserSockets(user.id, 'Password reset');
   forgotPasswordCodes.delete(query);
 
@@ -846,45 +943,25 @@ app.post('/api/auth/withdrawal/request-code', requireAuth, (req, res) => {
     attempts: 0
   });
 
-  userEmails.unshift({
+  deliverSecurityCode(caller.email, 'WITHDRAWAL', code);
+
+  recordUserEmail({
     id: 'email_' + Date.now(),
     userId: caller.id,
     userEmail: caller.email,
-    subject: 'Withdrawal Email Verification Code',
-    snippet: `Your withdrawal code is ${code}`,
-    body: `You requested a withdrawal from your WorkPerHour wallet. Use verification code ${code} to complete the transaction.`,
+    subject: 'Withdrawal Email Verification Requested',
+    snippet: 'Withdrawal verification code dispatched.',
+    body: 'You requested a withdrawal from your WorkPerHour wallet. Please use the verification code sent to your registered contact channel to complete the transaction.',
     date: new Date().toLocaleDateString(),
-    read: false
+    read: false,
+    type: 'GENERAL'
   });
 
-  res.json({ success: true, message: 'Withdrawal verification code sent to your registered email.', ...mockCode('mockWithdrawalCode', code) });
+  res.json({ success: true, message: 'Withdrawal verification code sent to your registered email.' });
 });
 
 app.post('/api/auth/withdrawal/verify-and-execute', requireAuth, (req, res) => {
   const caller = (req as any).authenticatedUser;
-  const { code, amount, method, accountDetails } = req.body || {};
-
-  if (!code) return res.status(400).json({ error: 'Email verification code is required for withdrawal.' });
-
-  const record = withdrawalVerificationCodes.get(caller.id);
-  if (!record) {
-    return res.status(400).json({ error: 'No active withdrawal verification code found. Please request a new code.' });
-  }
-  if (Date.now() > record.expiresAt) {
-    withdrawalVerificationCodes.delete(caller.id);
-    return res.status(400).json({ error: 'Withdrawal verification code has expired.' });
-  }
-  if (record.attempts >= 5) {
-    withdrawalVerificationCodes.delete(caller.id);
-    return res.status(429).json({ error: 'Too many incorrect attempts. Verification code invalidated.' });
-  }
-  if (record.code !== code.trim()) {
-    record.attempts++;
-    return res.status(400).json({ error: 'Invalid verification code.' });
-  }
-
-  withdrawalVerificationCodes.delete(caller.id);
-
   req.body.userId = caller.id;
   return handlePayoutRequest(req, res);
 });
@@ -1054,288 +1131,16 @@ wss.on('error', (err) => {
   console.error('WSS Server error:', err);
 });
 
-// Interfaces
-interface User {
-  id: string;
-  name: string;
-  username?: string;
-  email: string;
-  mobile?: string;
-  role: 'user' | 'admin' | 'super_admin' | 'moderator' | 'support' | string;
-  avatar: string;
-  title: string;
-  rating: number;
-  reviewsCount: number;
-  hourlyRate: number;
-  earned: number;
-  completedJobs: number;
-  bio: string;
-  skills: string[];
-  status: 'active' | 'suspended' | 'restricted';
-  verified: boolean;
-  emailVerified?: boolean;
-  mobileVerified?: boolean;
-  walletBalance: number;
-  createdAt: string;
-  isFlagged?: boolean;
-  flagReason?: string;
-  password?: string;
-  sessionVersion?: number;
-  knownDevices?: string[];
-  isAvailableNow?: boolean;
-}
+// Authoritative interfaces are imported from ./server/store.js at the top of this file.
 
-interface GigExtra {
-  id: string;
-  title: string;
-  price: number;
-}
 
-interface Gig {
-  id: string;
-  freelancerId: string;
-  freelancerName: string;
-  freelancerUsername?: string;
-  freelancerAvatar: string;
-  freelancerLevel?: string;
-  title: string;
-  slug?: string;
-  category: string;
-  subcategory?: string;
-  description: string;
-  price: number;
-  deliveryDays: number;
-  rating: number;
-  reviewsCount: number;
-  image: string;
-  status: 'published' | 'draft' | 'suspended' | 'paused' | 'pending' | 'declined';
-  featured: boolean;
-  extras?: GigExtra[];
-  moderationStatus?: 'approved' | 'flagged' | 'rejected' | 'pending';
-  moderationNotes?: string;
-}
 
-interface Project {
-  id: string;
-  buyerId: string;
-  buyerName: string;
-  buyerAvatar: string;
-  title: string;
-  slug?: string;
-  category: string;
-  subcategory?: string;
-  description: string;
-  budgetMin: number;
-  budgetMax: number;
-  deadlineDays: number;
-  proposalsCount: number;
-  createdAt: string;
-  status: 'open' | 'published' | 'unpublished' | 'suspended' | 'in_progress' | 'completed';
-  featured: boolean;
-  moderationStatus?: 'approved' | 'flagged' | 'rejected' | 'pending';
-  moderationNotes?: string;
-}
 
-interface Proposal {
-  id: string;
-  projectId: string;
-  freelancerId: string;
-  freelancerName: string;
-  freelancerAvatar: string;
-  freelancerTitle: string;
-  coverLetter: string;
-  bidAmount: number;
-  deliveryDays: number;
-  createdAt: string;
-  status: 'pending' | 'accepted' | 'rejected';
-  workstreamOrderId?: string;
-  offerId?: string;
-}
 
-interface Order {
-  id: string;
-  workspaceId?: string;
-  orderType?: 'gig' | 'project';
-  gigOrderId?: string;
-  projectOrderId?: string;
-  title: string;
-  buyerId: string;
-  sellerId: string;
-  amount: number;
-  status: 'payment_pending' | 'funded_in_escrow' | 'in_progress' | 'delivered' | 'completed' | 'disputed' | 'revision' | 'cancelled' | 'draft_review' | 'work_in_progress';
-  previousStatus?: string;
-  createdAt: string;
-  completedAt?: string;
-  dueDate: string;
-  requirements?: string;
-  deliverables?: string;
-  deliverableFiles?: Array<{ id?: string; name: string; url: string; size: string; uploadedAt?: string }>;
-  revisions?: Array<{ id: string; requestedAt: string; reason: string; status: string; version?: number; deliveryVersion?: number }>;
-  adminNotes?: string;
-  isMuted?: boolean;
-  escrowProtectionStartDate?: string;
-  escrowProtectionEndDate?: string;
-  gigId?: string;
-  projectId?: string;
-  proposalId?: string;
-  serviceUrl?: string;
-  gigSlug?: string;
-  sellerUsername?: string;
-  buyerUsername?: string;
-  serviceTitle?: string;
-  serviceThumbnail?: string;
-  isTimerPaused?: boolean;
-  feeBreakdown?: OrderFeeBreakdown;
-  deliveryHistory?: Array<{
-    version: number;
-    notes?: string;
-    message?: string;
-    reference?: string;
-    files: Array<{ id?: string; name: string; size: string; url: string; uploadedAt?: string }>;
-    deliveredAt: string;
-  }>;
-  deliveryNotes?: string;
-  deliveryReference?: string;
-  acceptedVersion?: number;
-  reviewWindowDays?: number;
-  reviewWindowExpiresAt?: string;
-  review?: Review;
-}
 
-interface Dispute {
-  id: string;
-  orderId: string;
-  raisedBy: string;
-  reason: string;
-  evidence: string;
-  status: 'open' | 'under_investigation' | 'resolved_refund' | 'resolved_release' | 'resolved_partial';
-  createdAt: string;
-  resolutionNotes?: string;
-  assignedTo?: string;
-}
 
-interface Refund {
-  id: string;
-  orderId: string;
-  buyerId: string;
-  amount: number;
-  reason: string;
-  status: 'pending' | 'approved' | 'rejected';
-  createdAt: string;
-}
 
-interface Payout {
-  id: string;
-  freelancerId: string;
-  amount: number;
-  method: 'UPI' | 'Bank Transfer' | 'Stripe' | 'Razorpay' | 'PayPal';
-  status: 'pending' | 'approved' | 'processed' | 'failed' | 'cancelled' | 'reversed';
-  createdAt: string;
-  accountDetails: string;
-}
 
-interface Category {
-  id: string;
-  name: string;
-  slug: string;
-  enabled: boolean;
-  order: number;
-  subcategories: { id: string; name: string; slug: string; enabled: boolean }[];
-}
-
-interface Review {
-  id: string;
-  orderId?: string;
-  reviewerId?: string;
-  reviewerName?: string;
-  reviewerAvatar?: string;
-  targetUserId?: string;
-  rating: number;
-  comment?: string;
-  orderTitle?: string;
-  gigId?: string;
-  projectId?: string;
-  createdAt?: string;
-  updatedAt?: string;
-  isCancelledOrder?: boolean;
-  reply?: {
-    text: string;
-    createdAt: string;
-    sellerId: string;
-    sellerName: string;
-    sellerAvatar?: string;
-  };
-}
-
-interface SupportTicket {
-  id: string;
-  userId: string;
-  userName: string;
-  subject: string;
-  priority: 'low' | 'medium' | 'high' | 'urgent';
-  status: 'open' | 'in_progress' | 'resolved' | 'closed';
-  createdAt: string;
-  messages: { sender: string; text: string; timestamp: string }[];
-}
-
-interface AuditLog {
-  id: string;
-  actor: string;
-  role: string;
-  action: string;
-  target: string;
-  details: string;
-  timestamp: string;
-}
-
-interface Message {
-  id: string;
-  orderId: string;
-  senderId: string;
-  senderName: string;
-  text: string;
-  timestamp: string;
-  type?: 'message' | 'system' | 'file' | 'deliverable';
-  fileInfo?: { name: string; size: string; url: string; type?: string; category?: string };
-  metadata?: {
-    amount?: number;
-    action?: string;
-    milestoneTitle?: string;
-    version?: number;
-    notes?: string;
-    reference?: string;
-    reason?: string;
-    rating?: number;
-    comment?: string;
-    revisionId?: string;
-    deliveryVersion?: number;
-    requirementText?: string;
-    clientMessageId?: string;
-    acceptedVersion?: number;
-    reviewWindowDays?: number;
-    disputeId?: string;
-    raisedBy?: string;
-    isCancelledOrder?: boolean;
-    reply?: any;
-    offerId?: string;
-    offerKind?: string;
-    proposalId?: string;
-    status?: string;
-  };
-}
-
-interface UserEmail {
-  id: string;
-  userId: string;
-  userEmail: string;
-  subject: string;
-  snippet?: string;
-  body: string;
-  type?: 'SUSPEND' | 'RESTRICT' | 'DEACTIVATE' | 'IMPERSONATE' | 'GENERAL';
-  sentAt?: string;
-  date?: string;
-  read: boolean;
-}
 
 
 function notifyUser(message: Message, targetUserId: string) {
@@ -1391,7 +1196,7 @@ function notifyUserOnAdminAction(user: User, action: 'suspended' | 'restricted' 
     sentAt: timestamp,
     read: false
   };
-  userEmails.unshift(newEmail);
+  recordUserEmail(newEmail);
 
   // 2. Add System Chat Message into User's Support Thread
   const supportOrderId = `support_admin_${user.id}`;
@@ -1406,7 +1211,7 @@ function notifyUserOnAdminAction(user: User, action: 'suspended' | 'restricted' 
     metadata: { action: `admin_${action}` }
   };
   recordMessage(newChatMsg);
-  saveMessagesToDisk();
+  postgresStore.saveMessages(messages);
 
   // 3. Broadcast WS message
   try {
@@ -1427,28 +1232,21 @@ if (IS_PRODUCTION && process.env.ADMIN_INITIAL_PASSWORD && process.env.ADMIN_INI
 }
 
 
-// Initial Data Seeds & Persistent Storage Engine
-export let users: User[] = SEED_USERS.map(u => ({
-  ...u,
-  sessionVersion: u.sessionVersion || 1,
-  knownDevices: u.knownDevices || ['dev_default_session']
-}));
-
-export let gigs: Gig[] = [...SEED_GIGS];
-export let orders: Order[] = [...SEED_ORDERS];
-export let projects: Project[] = [...SEED_PROJECTS];
-export let proposals: Proposal[] = [...SEED_PROPOSALS];
-export let reviews: Review[] = [...SEED_REVIEWS];
-export let messages: Message[] = [...SEED_MESSAGES];
-
-// Initialize default wallets for seeded users
-for (const u of users) {
-  ensureWallet(u.id);
-}
-
-export let disputes: Dispute[] = [];
-export let refunds: Refund[] = [];
-export let payouts: Payout[] = [];
+// Persistent Storage Engine (unified with server/store.js)
+export {
+  users,
+  gigs,
+  orders,
+  projects,
+  proposals,
+  reviews,
+  messages,
+  disputes,
+  refunds,
+  payouts,
+  customInvoices,
+  workstreamOffers
+} from './server/store.js';
 
 let categories: Category[] = [
   {
@@ -1585,75 +1383,40 @@ let categories: Category[] = [
   }
 ];
 
-let supportTickets: SupportTicket[] = [];
-
-export let auditLogs: AuditLog[] = [];
-
 // ==========================================
 // WORKSTREAM PERSISTENT STORAGE ENGINE
 // ==========================================
-const DATA_DIR = path.join(__dirname, 'data');
-const MESSAGES_FILE = path.join(DATA_DIR, 'workstream_messages.json');
-const ORDERS_FILE = path.join(DATA_DIR, 'workstream_orders.json');
-const REVIEWS_FILE = path.join(DATA_DIR, 'workstream_reviews.json');
-const REFUNDS_FILE = path.join(DATA_DIR, 'workstream_refunds.json');
-const DISPUTES_FILE = path.join(DATA_DIR, 'workstream_disputes.json');
-const PROPOSALS_FILE = path.join(DATA_DIR, 'workstream_proposals.json');
-const PAYOUTS_FILE = path.join(DATA_DIR, 'workstream_payouts.json');
-const PROJECTS_FILE = path.join(DATA_DIR, 'workstream_projects.json');
-const UPLOAD_INDEX_FILE = path.join(DATA_DIR, 'workstream_uploads.json'); // Added for completeness
+// DATA_DIR is defined above near __dirname
 
-function ensureDataDirectory() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
+export function saveProposalsToDisk() { 
+  postgresStore.saveProposals(proposals).catch(err => console.error('[PostgresStore] Failed to save proposals:', err)); 
+}
+export function savePayoutsToDisk() { 
+  postgresStore.savePayouts(payouts).catch(err => console.error('[PostgresStore] Failed to save payouts:', err)); 
+}
+export function saveProjectsToDisk() { 
+  postgresStore.saveProjects(projects).catch(err => console.error('[PostgresStore] Failed to save projects:', err)); 
 }
 
-// Atomic writing logic
-const writeQueue = new Map<string, Promise<void>>();
-
-async function writeJsonAtomic(filePath: string, data: any) {
-  const serialized = JSON.stringify(data, null, 2);
-  const tempPath = `${filePath}.tmp.${Math.random().toString(36).substring(7)}`;
-  
-  const existingTask = writeQueue.get(filePath) || Promise.resolve();
-  
-  const task = existingTask.then(async () => {
-    ensureDataDirectory();
-    fs.writeFileSync(tempPath, serialized, 'utf-8');
-    fs.renameSync(tempPath, filePath);
-  }).catch(err => {
-    console.error(`Failed to atomic write ${filePath}:`, err);
-    if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-  });
-  
-  writeQueue.set(filePath, task);
-  return task;
+export function saveUsersToPostgres() {
+  return postgresStore.saveUsers(users).catch(err => console.error('[PostgresStore] Failed to save users:', err));
 }
-
-export function saveMessagesToDisk() { return writeJsonAtomic(MESSAGES_FILE, messages); }
-export function saveOrdersToDisk() { return writeJsonAtomic(ORDERS_FILE, orders); }
-export function saveReviewsToDisk() { return writeJsonAtomic(REVIEWS_FILE, reviews); }
-export function saveRefundsToDisk() { return writeJsonAtomic(REFUNDS_FILE, refunds); }
-export function saveDisputesToDisk() { return writeJsonAtomic(DISPUTES_FILE, disputes); }
-export function saveProposalsToDisk() { return writeJsonAtomic(PROPOSALS_FILE, proposals); }
-export function savePayoutsToDisk() { return writeJsonAtomic(PAYOUTS_FILE, payouts); }
-export function saveProjectsToDisk() { return writeJsonAtomic(PROJECTS_FILE, projects); }
-export function saveWorkstreamUploadIndex() { return writeJsonAtomic(WORKSTREAM_UPLOAD_INDEX_FILE, workstreamUploadIndex); }
-
-function handleCorruption(filePath: string, error: any) {
-  console.error(`CRITICAL: Data corruption in ${filePath}:`, error);
-  if (process.env.ALLOW_EMPTY_DATA !== 'true') {
-    const backupPath = `${filePath}.corrupt-${Date.now()}`;
-    fs.renameSync(filePath, backupPath);
-    console.error(`Refusing to start. Broken file renamed to ${backupPath}. Set ALLOW_EMPTY_DATA=true to bypass.`);
-    process.exit(1);
-  }
+export function saveGigsToPostgres() {
+  return postgresStore.saveGigs(gigs).catch(err => console.error('[PostgresStore] Failed to save gigs:', err));
 }
 
 const MAX_AUDIT_LOGS = 1000;
-const orderIndex = new Map<string, Order>();
-const messageIndex = new Map<string, Message[]>();
+export const orderIndex = new Map<string, Order>();
+const _origOrderIndexGet = orderIndex.get.bind(orderIndex);
+orderIndex.get = function(id: string) {
+  let val = _origOrderIndexGet(id);
+  if (!val && id) {
+    val = orders.find(o => o.id === id);
+    if (val) orderIndex.set(id, val);
+  }
+  return val;
+};
+export const messageIndex = new Map<string, Message[]>();
 
 // Simple in-memory locking mechanism to prevent race conditions on sensitive order state transitions.
 const orderStateLocks = new Set<string>();
@@ -1679,7 +1442,7 @@ function releaseOrderLock(orderId: string) {
   orderStateLocks.delete(orderId);
 }
 
-function registerOrder(o: Order) {
+export function registerOrder(o: Order) {
   if (!o.id) return;
   orderIndex.set(o.id, o);
 }
@@ -1712,223 +1475,24 @@ function recordMessage(m: Message) {
 function registerAuditLog(log: AuditLog) {
   auditLogs.unshift(log);
   if (auditLogs.length > MAX_AUDIT_LOGS) {
-    auditLogs = auditLogs.slice(0, MAX_AUDIT_LOGS);
+    auditLogs.length = MAX_AUDIT_LOGS;
   }
+  postgresStore.saveAuditLogs(auditLogs).catch(err => console.error('[PostgresStore] Failed to save audit logs:', err));
 }
 
-function loadInitialOrdersAndMessages() {
-  ensureDataDirectory();
-  
+export function syncIndexes() {
   orderIndex.clear();
   messageIndex.clear();
-  
-  // 1. Load Orders
-  if (fs.existsSync(ORDERS_FILE)) {
-    try {
-      const data = fs.readFileSync(ORDERS_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        orders = parsed;
-        orders.forEach(registerOrder);
-      } else {
-        orders = [...SEED_ORDERS];
-        orders.forEach(registerOrder);
-      }
-    } catch (e) {
-      handleCorruption(ORDERS_FILE, e);
-    }
-  } else {
-    orders.forEach(registerOrder);
+  for (const o of orders) {
+    registerOrder(o);
   }
-
-  // Run safe, idempotent legacy workspace migration on startup
-  const migrationRes = workspaceService.migrateLegacyOrders(orders, false);
-  if (migrationRes.migratedCount > 0) {
-    console.log(`[WorkspaceMigration] Migrated ${migrationRes.migratedCount} legacy orders to Workspaces on startup.`);
-    saveOrdersToDisk();
-    workspaceService.saveToDisk();
+  for (const m of messages) {
+    registerMessage(m);
   }
-
-  // RECOVERY: Reconcile any 'payment_pending' orders with the financial ledger (Crash Safety)
-  let recoveryNeeded = false;
-  for (const order of orders) {
-    if (order.status === 'payment_pending') {
-      const escrow = financeLedger.getEscrow(order.id);
-      if (escrow) {
-        console.log(`[Recovery] Order ${order.id} was in payment_pending but ledger has escrow. Recovering to funded_in_escrow.`);
-        order.status = 'funded_in_escrow';
-        order.previousStatus = undefined;
-        recoveryNeeded = true;
-      } else {
-        console.log(`[Recovery] Order ${order.id} was in payment_pending but ledger has no escrow. Recovering to ${order.previousStatus || 'cancelled'}.`);
-        order.status = (order.previousStatus as any) || 'cancelled';
-        order.previousStatus = undefined;
-        recoveryNeeded = true;
-      }
-    }
-  }
-  if (recoveryNeeded) {
-    saveOrdersToDisk();
-  }
-
-  // 2. Load Messages
-  if (fs.existsSync(MESSAGES_FILE)) {
-    try {
-      const data = fs.readFileSync(MESSAGES_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        const existingIds = new Set(parsed.map((m: any) => m.id));
-        const merged = [...SEED_MESSAGES.filter(m => !existingIds.has(m.id)), ...parsed];
-        const seenIds = new Set<string>();
-        messages = merged.filter((m: any) => {
-          if (!m?.id) return true;
-          if (seenIds.has(m.id)) return false;
-          seenIds.add(m.id);
-          return true;
-        });
-      } else {
-        messages = [...SEED_MESSAGES];
-      }
-    } catch (e) {
-      handleCorruption(MESSAGES_FILE, e);
-    }
-  } else {
-    messages = [...SEED_MESSAGES];
-  }
-  saveMessagesToDisk();
-
-  // 3. Load Reviews
-  if (fs.existsSync(REVIEWS_FILE)) {
-    try {
-      const data = fs.readFileSync(REVIEWS_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed)) {
-        reviews = parsed;
-      }
-    } catch (e) {
-      handleCorruption(REVIEWS_FILE, e);
-    }
-  }
-
-  // 4. Load Refunds
-  if (fs.existsSync(REFUNDS_FILE)) {
-    try {
-      const data = fs.readFileSync(REFUNDS_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed)) {
-        refunds = parsed;
-      }
-    } catch (e) {
-      handleCorruption(REFUNDS_FILE, e);
-    }
-  }
-
-  // 5. Load Disputes
-  if (fs.existsSync(DISPUTES_FILE)) {
-    try {
-      const data = fs.readFileSync(DISPUTES_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed)) {
-        disputes = parsed;
-      }
-    } catch (e) {
-      handleCorruption(DISPUTES_FILE, e);
-    }
-  }
-
-  // 6. Load Proposals
-  if (fs.existsSync(PROPOSALS_FILE)) {
-    try {
-      const data = fs.readFileSync(PROPOSALS_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        const parsedIds = new Set(parsed.map((p: any) => p.id));
-        proposals = [...parsed, ...SEED_PROPOSALS.filter(p => !parsedIds.has(p.id))];
-      }
-    } catch (e) {
-      console.error('Failed to load proposals file:', e);
-    }
-  }
-
-  // 8. Load Projects
-  if (fs.existsSync(PROJECTS_FILE)) {
-    try {
-      const data = fs.readFileSync(PROJECTS_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        const parsedIds = new Set(parsed.map((p: any) => p.id));
-        projects = [...parsed, ...SEED_PROJECTS.filter(p => !parsedIds.has(p.id))];
-      }
-    } catch (e) {
-      console.error('Failed to load projects file:', e);
-    }
-  }
-  saveProjectsToDisk();
-
-  // 7. Load Payouts
-  if (fs.existsSync(PAYOUTS_FILE)) {
-    try {
-      const data = fs.readFileSync(PAYOUTS_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed)) {
-        payouts = parsed;
-      }
-    } catch (e) {
-      console.error('Failed to load payouts file:', e);
-    }
-  }
-
-  // One-time migration & Index Population
-  let messagesMigrated = false;
-  for (const msg of messages) {
-    if (!msg.timestamp || !/\d{4}-\d{2}-\d{2}/.test(msg.timestamp)) {
-      const order = orderIndex.get(msg.orderId);
-      let baseDate = order?.createdAt;
-      if (!baseDate || !/\d{4}-\d{2}-\d{2}/.test(baseDate)) {
-        baseDate = new Date().toISOString();
-      }
-      const datePart = baseDate.split('T')[0];
-
-      const timeMatch = msg.timestamp ? msg.timestamp.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?/i) : null;
-      let hours = 0, minutes = 0, seconds = 0;
-      if (timeMatch) {
-        hours = parseInt(timeMatch[1], 10);
-        minutes = parseInt(timeMatch[2], 10);
-        seconds = timeMatch[3] ? parseInt(timeMatch[3], 10) : 0;
-        const ampm = timeMatch[4] ? timeMatch[4].toUpperCase() : '';
-        if (ampm === 'PM' && hours < 12) hours += 12;
-        if (ampm === 'AM' && hours === 12) hours = 0;
-      }
-
-      const d = new Date(`${datePart}T00:00:00.000Z`);
-      if (!isNaN(d.getTime())) {
-        d.setUTCHours(hours, minutes, seconds, 0);
-        msg.timestamp = d.toISOString();
-      } else {
-        msg.timestamp = new Date().toISOString();
-      }
-      messagesMigrated = true;
-    }
-    registerMessage(msg);
-  }
-  
-  if (messagesMigrated) {
-    saveMessagesToDisk();
-    console.log('Migrated legacy non-ISO message timestamps to ISO strings.');
-  }
-
-  // Synchronize user review stats
   for (const u of users) {
     recalculateUserRating(u.id);
   }
-
-  saveOrdersToDisk();
-  saveMessagesToDisk();
-  saveReviewsToDisk();
 }
-
-// Execute initial load
-loadInitialOrdersAndMessages();
 
 function enrichOrderWithServiceInfo(o: Order, isAdmin: boolean = false) {
   // Link a gig only when the order references it (or its title matches exactly). Guessing "the seller's first gig"
@@ -2325,7 +1889,7 @@ function pushSystemMessage(orderId: string, text: string, action = 'system_notic
     metadata: { action }
   };
   recordMessage(msg);
-  saveMessagesToDisk();
+  postgresStore.saveMessages(messages);
   broadcastMessage(msg, orderId);
 }
 
@@ -2334,7 +1898,7 @@ function closeActiveDispute(orderId: string, status: Dispute['status'], notes: s
   if (d) {
     d.status = status;
     d.resolutionNotes = notes;
-    saveDisputesToDisk();
+    postgresStore.saveDisputes(disputes);
     emitSystemEvent(orderId, 'dispute_resolved', `✅ Dispute resolved: ${status.replace('_', ' ')}. Note: ${notes}`);
   }
 }
@@ -2406,7 +1970,7 @@ function releaseOrderFunds(order: Order, actor: string, reason: string, approved
     seller.completedJobs = (seller.completedJobs || 0) + 1;
   }
   syncUserBalances();
-  saveOrdersToDisk();
+  postgresStore.saveOrders(orders);
 
   // If this was a buyer-triggered approval, emit deliverable_approved first
   if (approvedByBuyer) {
@@ -2463,8 +2027,8 @@ function refundOrderFunds(order: Order, amount: number | undefined, actor: strin
     });
   }
   syncUserBalances();
-  saveOrdersToDisk();
-  saveRefundsToDisk();
+  postgresStore.saveOrders(orders);
+  postgresStore.saveRefunds(refunds);
 
   emitSystemEvent(order.id, 'escrow_refunded', `💸 Escrow refunded ($${result.refunded.toLocaleString()}) to buyer wallet. Reason: ${reason}`, {
     refunded: result.refunded,
@@ -2507,8 +2071,8 @@ function splitOrderFunds(order: Order, refundAmount: number, actor: string, reas
     });
   }
   syncUserBalances();
-  saveOrdersToDisk();
-  saveRefundsToDisk();
+  postgresStore.saveOrders(orders);
+  postgresStore.saveRefunds(refunds);
 
   emitSystemEvent(order.id, 'escrow_refunded', `💸 Partial escrow refund ($${refundAmount.toLocaleString()}) credited to buyer wallet.`, { refunded: refundAmount, isSplit: true });
   emitSystemEvent(order.id, 'escrow_released', `🎉 Remaining escrow released to seller ($${result.release.freelancerNet.toLocaleString()} net).`, { freelancerNet: result.release.freelancerNet, isSplit: true });
@@ -2687,14 +2251,14 @@ app.patch('/api/orders/:id/extend-time', requireAdmin, async (req, res) => {
     metadata: { action: 'order_deadline_extended', oldDate, newDueDate: order.dueDate, reason } as any
   };
   recordMessage(sysMsg);
-  await saveMessagesToDisk();
-  await saveOrdersToDisk();
+  await postgresStore.saveMessages(messages);
+  await postgresStore.saveOrders(orders);
   broadcastMessage(sysMsg, order.id);
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: 'ORDER_DEADLINE_EXTENDED',
     target: `Order #${order.id}`,
     details: `Extended deadline to ${order.dueDate} (${days || 'custom'} days). ${reason || ''}`,
@@ -2710,7 +2274,7 @@ app.post('/api/orders/:id/admin-notes', requireAdmin, async (req, res) => {
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
   order.adminNotes = req.body.notes || '';
-  await saveOrdersToDisk();
+  await postgresStore.saveOrders(orders);
   res.json({ success: true, adminNotes: order.adminNotes });
 });
 
@@ -2846,7 +2410,7 @@ app.post('/api/orders/:id/deliverable', requireAuth, async (req, res) => {
         existingPendingInv.note = trimmedNotes || existingPendingInv.note;
         existingPendingInv.files = uploadedFiles.length > 0 ? uploadedFiles : existingPendingInv.files;
         existingPendingInv.reference = storedReference || existingPendingInv.reference;
-        await saveOffersToDisk();
+        await postgresStore.saveOffers(workstreamOffers);
         createdInvoiceOffer = viewOffer(existingPendingInv);
       } else if (invAmt > 0) {
         const newInv: WorkstreamOffer = {
@@ -2864,13 +2428,13 @@ app.post('/api/orders/:id/deliverable', requireAuth, async (req, res) => {
           createdAt: new Date().toISOString()
         };
         workstreamOffers.push(newInv);
-        await saveOffersToDisk();
+        await postgresStore.saveOffers(workstreamOffers);
         postOfferMessage(order, newInv, { id: caller?.id || order.sellerId, name: caller?.name || 'Seller' }, `New invoice ${newInv.number}: ${invTitle}`, 'offer_created');
         createdInvoiceOffer = viewOffer(newInv);
       }
     }
 
-    await saveOrdersToDisk();
+    await postgresStore.saveOrders(orders);
 
     res.json({ success: true, files: uploadedFiles, file: uploadedFiles[0], offer: createdInvoiceOffer, order: enrichOrderWithServiceInfo(order) });
   } catch (err: any) {
@@ -2920,7 +2484,7 @@ app.post('/api/orders/:id/revision', requireAuth, async (req, res) => {
   order.revisions.push(revisionEntry);
   order.status = 'revision';
 
-  await saveOrdersToDisk();
+  await postgresStore.saveOrders(orders);
 
   emitSystemEvent(order.id, 'revision_requested', `Revision requested: "${reason}"`, {
     revisionId: revisionEntry.id,
@@ -2993,10 +2557,11 @@ app.post('/api/orders/:id/dispute', requireAuth, (req, res) => {
       }
     };
     recordMessage(sysMsg);
-    saveMessagesToDisk();
-    saveOrdersToDisk();
-    saveDisputesToDisk();
+    postgresStore.saveMessages(messages);
+    postgresStore.saveOrders(orders);
+    postgresStore.saveDisputes(disputes);
     broadcastMessage(sysMsg, order.id);
+    notifyOrderParties(order.id, 'dispute_opened', sysMsg.text, sysMsg.id);
 
     res.json({ success: true, dispute: newDispute, order: enrichOrderWithServiceInfo(order) });
   } catch (err: any) {
@@ -3012,7 +2577,7 @@ app.patch('/api/orders/:id/mute', requireRole(['admin', 'super_admin', 'support'
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
   order.isMuted = !order.isMuted;
-  await saveOrdersToDisk();
+  await postgresStore.saveOrders(orders);
   const sysMsg: Message = {
     id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
     orderId: order.id,
@@ -3026,7 +2591,7 @@ app.patch('/api/orders/:id/mute', requireRole(['admin', 'super_admin', 'support'
     metadata: { action: order.isMuted ? 'chat_muted' : 'chat_unmuted' }
   };
   recordMessage(sysMsg);
-  await saveMessagesToDisk();
+  await postgresStore.saveMessages(messages);
   broadcastMessage(sysMsg, order.id);
 
   res.json({ success: true, isMuted: order.isMuted });
@@ -3038,7 +2603,7 @@ app.patch('/api/orders/:id/pause-timer', requireRole(['admin', 'super_admin', 's
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
   order.isTimerPaused = !order.isTimerPaused;
-  await saveOrdersToDisk();
+  await postgresStore.saveOrders(orders);
   const sysMsg: Message = {
     id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
     orderId: order.id,
@@ -3052,13 +2617,13 @@ app.patch('/api/orders/:id/pause-timer', requireRole(['admin', 'super_admin', 's
     metadata: { action: order.isTimerPaused ? 'timer_paused' : 'timer_resumed' }
   };
   recordMessage(sysMsg);
-  saveMessagesToDisk();
+  postgresStore.saveMessages(messages);
   broadcastMessage(sysMsg, order.id);
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: order.isTimerPaused ? 'ORDER_TIMER_PAUSED' : 'ORDER_TIMER_RESUMED',
     target: `Order #${order.id}`,
     details: order.isTimerPaused ? 'Timer paused by Admin' : 'Timer resumed by Admin',
@@ -3075,6 +2640,7 @@ app.patch('/api/users/availability', requireAuth, (req, res) => {
   const user = users.find(u => u.id === userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
   user.isAvailableNow = !!isAvailableNow;
+  saveUsersToPostgres();
   res.json({ success: true, user: safeUser(user) });
 });
 
@@ -3085,6 +2651,7 @@ app.post('/api/users/:id/flag', requireAdmin, (req, res) => {
 
   user.isFlagged = !user.isFlagged;
   user.flagReason = user.isFlagged ? (req.body.reason || 'Flagged for TOS investigation.') : undefined;
+  saveUsersToPostgres();
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -3185,7 +2752,7 @@ app.post('/api/orders/:id/message', requireAuth, rateLimit(120, 60_000), async (
     const newMsg = sanitizeAndCreateMessage(user, order, req.body, fileCheck);
 
     recordMessage(newMsg);
-    await saveMessagesToDisk();
+    await postgresStore.saveMessages(messages);
     broadcastMessage(newMsg, order.id);
 
     res.json({ success: true, message: newMsg });
@@ -3272,17 +2839,9 @@ interface CustomInvoice {
 
 let savedPaymentMethods: PaymentMethodRecord[] = [];
 
-const CUSTOM_INVOICES_FILE = path.join(DATA_DIR, 'custom_invoices.json');
-let customInvoices: CustomInvoice[] = [];
-try {
-  if (fs.existsSync(CUSTOM_INVOICES_FILE)) {
-    const parsed = JSON.parse(fs.readFileSync(CUSTOM_INVOICES_FILE, 'utf-8'));
-    if (Array.isArray(parsed)) customInvoices = parsed;
-  }
-} catch (e) {
-  console.error('Failed to load custom invoices:', e);
+function saveCustomInvoicesToDisk() { 
+  postgresStore.saveCustomInvoices(customInvoices).catch(err => console.error('[PostgresStore] Failed to save custom invoices:', err)); 
 }
-function saveCustomInvoicesToDisk() { writeJsonAtomic(CUSTOM_INVOICES_FILE, customInvoices); }
 
 // User Financial Overview Snapshot
 app.get('/api/payments/user/:userId', requireAuth, (req, res) => {
@@ -3382,6 +2941,12 @@ function handlePayoutRequest(req: Request, res: Response) {
     const user = users.find(u => u.id === freelancerId) || users[0];
     ensureWallet(freelancerId);
 
+    // CRITICAL SECURITY FIX: Withdrawal email verification code MUST be verified and consumed
+    const verification = verifyAndConsumeWithdrawalCode(freelancerId, req.body?.code);
+    if (!verification.ok) {
+      return res.status(verification.status).json({ error: verification.error });
+    }
+
     const rawMethod = String(req.body?.method || 'Bank Transfer');
     const settingKey = ALLOWED_METHODS[rawMethod];
     if (!settingKey || !DEFAULT_SITE_SETTINGS.wallets.allowedPayoutMethods[settingKey]) {
@@ -3419,7 +2984,7 @@ function handlePayoutRequest(req: Request, res: Response) {
       accountDetails: payout.accountDetails
     };
     payouts.unshift(record);
-    savePayoutsToDisk();
+    postgresStore.savePayouts(payouts);
     syncUserBalances();
 
     registerAuditLog({
@@ -3622,7 +3187,7 @@ app.post('/api/payments/escrow/release', requireAuth, (req, res) => {
   try {
     const userId = (req as any).authenticatedUserId;
     const caller = users.find(u => u.id === userId);
-    const order = orderIndex.get(orderId);
+    const order = orderIndex.get(orderId) || orders.find(o => o.id === orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
     const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin';
@@ -3658,7 +3223,7 @@ app.post('/api/payments/escrow/release', requireAuth, (req, res) => {
         metadata: { action: 'revision_resolved' }
       };
       recordMessage(sysMsg);
-      saveMessagesToDisk();
+      postgresStore.saveMessages(messages);
       broadcastMessage(sysMsg, order.id);
     }
 
@@ -3680,7 +3245,7 @@ app.post('/api/payments/escrow/release', requireAuth, (req, res) => {
       pendingMatchingInvoice.status = 'paid';
       pendingMatchingInvoice.resolvedAt = new Date().toISOString();
       pendingMatchingInvoice.resolvedBy = caller?.id || userId;
-      saveOffersToDisk();
+      postgresStore.saveOffers(workstreamOffers);
     }
 
     const seller = users.find(u => u.id === order.sellerId);
@@ -3825,7 +3390,7 @@ app.post('/api/payments/escrow/deposit', requireAuth, rateLimit(20, 60_000), (re
     order.escrowProtectionStartDate = today;
     order.escrowProtectionEndDate = new Date(Date.now() + DEFAULT_SITE_SETTINGS.commission.escrowProtectionDays * 86400000).toISOString().split('T')[0];
     syncUserBalances();
-    saveOrdersToDisk();
+    postgresStore.saveOrders(orders);
 
     const newBalance = financeLedger.getWalletBalance(buyerId) ?? buyer.walletBalance;
     res.json({ success: true, order, newBalance });
@@ -4073,21 +3638,16 @@ app.patch('/api/payments/methods/:id/default', requireAuth, (req, res) => {
 // ==========================================
 
 // Reset Financial Ledger and Workstream Data to Pristine Clean State
-app.post('/api/admin/finance/reset-clean', requireRole(['admin', 'super_admin']), (req, res) => {
+app.post('/api/admin/finance/reset-clean', requireRole(['admin', 'super_admin']), async (req, res) => {
   try {
-    financeLedger.resetToCleanState();
-    orders = [];
+    await cleanAllStoreData();
     orderIndex.clear();
-    messages = [];
     messageIndex.clear();
-    workstreamOffers = [];
-    customInvoices = [];
-    disputes = [];
-    saveOrdersToDisk();
-    saveMessagesToDisk();
-    saveOffersToDisk();
-    saveCustomInvoicesToDisk();
-    res.json({ success: true, message: 'Financial ledger and workstream data reset to pristine clean state.' });
+    orderStateLocks.clear();
+    releaseCompletedOrders.clear();
+    refundCompletedOrders.clear();
+    requestKeyCache.clear();
+    res.json({ success: true, message: 'All demo and runtime data reset to pristine clean state.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
@@ -4339,7 +3899,7 @@ const approvePayout = (req: Request, res: Response) => {
     if (!p) return res.status(404).json({ error: 'Payout not found' });
     if (p.status !== 'pending') return res.status(400).json({ error: `Cannot approve payout in status "${p.status}"` });
     p.status = 'approved';
-    savePayoutsToDisk();
+    postgresStore.savePayouts(payouts);
     payoutAudit(req, 'PAYOUT_APPROVED', p, `Approved payout of $${p.amount} via ${p.method} for freelancer ${p.freelancerId}`);
     res.json(p);
   } catch (err: any) { res.status(400).json({ error: err.message }); }
@@ -4356,7 +3916,7 @@ const processPayout = (req: Request, res: Response) => {
     }
     const { journal } = financeLedger.settlePayout({ payoutId: p.id, actor: adminActor(req), providerReference: req.body?.providerReference });
     p.status = 'processed';
-    savePayoutsToDisk();
+    postgresStore.savePayouts(payouts);
     payoutAudit(req, 'PAYOUT_PROCESSED', p, `Processed payout of $${p.amount} via ${p.method}`);
     syncUserBalances();
     res.json({ success: true, payout: p, journal, ...p });
@@ -4370,7 +3930,7 @@ const rejectPayout = (req: Request, res: Response) => {
     if (p.status !== 'pending' && p.status !== 'approved') return res.status(400).json({ error: `Cannot reject payout in status "${p.status}"` });
     financeLedger.cancelPayout({ payoutId: p.id, reason: String(req.body?.reason || 'Administrative rejection'), actor: adminActor(req) });
     p.status = 'cancelled';
-    savePayoutsToDisk();
+    postgresStore.savePayouts(payouts);
     payoutAudit(req, 'PAYOUT_REJECTED', p, `Rejected payout of $${p.amount}; funds returned to wallet`);
     syncUserBalances();
     res.json({ success: true, payout: p, ...p });
@@ -4384,7 +3944,7 @@ const failPayout = (req: Request, res: Response) => {
     if (p.status !== 'pending' && p.status !== 'approved') return res.status(400).json({ error: `Cannot fail payout in status "${p.status}"` });
     financeLedger.failPayout({ payoutId: p.id, reason: String(req.body?.reason || 'Gateway reported a transfer failure'), actor: adminActor(req) });
     p.status = 'failed';
-    savePayoutsToDisk();
+    postgresStore.savePayouts(payouts);
     payoutAudit(req, 'PAYOUT_FAILED', p, `Payout of $${p.amount} failed; funds returned to wallet`);
     syncUserBalances();
     res.json(p);
@@ -4398,7 +3958,7 @@ const retryPayout = (req: Request, res: Response) => {
     if (p.status !== 'failed') return res.status(400).json({ error: 'Only failed payouts can be retried.' });
     financeLedger.retryPayout({ payoutId: p.id, actor: adminActor(req) });
     p.status = 'pending';
-    savePayoutsToDisk();
+    postgresStore.savePayouts(payouts);
     payoutAudit(req, 'PAYOUT_RETRIED', p, `Re-queued failed payout of $${p.amount}`);
     syncUserBalances();
     res.json(p);
@@ -4567,8 +4127,8 @@ app.post('/api/admin/categories', requireAdmin, (req, res) => {
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: 'CATEGORY_CREATED',
     target: `Category: ${name}`,
     details: `Created new main category "${name}" with slug /${catSlug}`,
@@ -4594,8 +4154,8 @@ app.post('/api/admin/categories/bulk-delete', requireAdmin, (req, res) => {
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: 'CATEGORIES_BULK_DELETED',
     target: 'Marketplace Categories',
     details: `Bulk deleted ${categoryIds.length} categories and ${subcategoryPairs.length} subcategories`,
@@ -4614,8 +4174,8 @@ app.patch('/api/admin/categories/:id', requireAdmin, (req, res) => {
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: 'CATEGORY_UPDATED',
     target: `Category: ${cat.name}`,
     details: `Updated category name/slug/status for ${cat.name}`,
@@ -4632,8 +4192,8 @@ app.patch('/api/admin/categories/:id/toggle', requireAdmin, (req, res) => {
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: cat.enabled ? 'CATEGORY_ENABLED' : 'CATEGORY_DISABLED',
     target: `Category: ${cat.name}`,
     details: `Toggled status of category ${cat.name} to ${cat.enabled ? 'Enabled' : 'Disabled'}`,
@@ -4651,8 +4211,8 @@ app.delete('/api/admin/categories/:id', requireAdmin, (req, res) => {
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: 'CATEGORY_DELETED',
     target: `Category: ${deleted.name}`,
     details: `Deleted category ${deleted.name}`,
@@ -4679,8 +4239,8 @@ app.post('/api/admin/categories/:id/subcategories', requireAdmin, (req, res) => 
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: 'SUBCATEGORY_CREATED',
     target: `Subcategory: ${name} (under ${cat.name})`,
     details: `Created subcategory ${name}`,
@@ -4701,8 +4261,8 @@ app.patch('/api/admin/categories/:id/subcategories/:subId', requireAdmin, (req, 
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: 'SUBCATEGORY_UPDATED',
     target: `Subcategory: ${sub.name}`,
     details: `Updated subcategory under ${cat.name}`,
@@ -4721,8 +4281,8 @@ app.patch('/api/admin/categories/:id/subcategories/:subId/toggle', requireAdmin,
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: sub.enabled ? 'SUBCATEGORY_ENABLED' : 'SUBCATEGORY_DISABLED',
     target: `Subcategory: ${sub.name}`,
     details: `Toggled subcategory status to ${sub.enabled ? 'Enabled' : 'Disabled'}`,
@@ -4742,8 +4302,8 @@ app.delete('/api/admin/categories/:id/subcategories/:subId', requireAdmin, (req,
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: 'SUBCATEGORY_DELETED',
     target: `Subcategory: ${deletedSub.name}`,
     details: `Deleted subcategory from ${cat.name}`,
@@ -4778,6 +4338,7 @@ function recalculateUserRating(userId: string) {
   } else {
     targetUser.rating = 0;
   }
+  saveUsersToPostgres();
 }
 
 function sanitizePublicReview(r: Review): Review {
@@ -4888,17 +4449,27 @@ app.post('/api/reviews', requireAuth, (req, res) => {
   };
 
   reviews.unshift(newReview);
-  saveReviewsToDisk();
+  postgresStore.saveReviews(reviews);
 
   if (isBuyerReviewer) {
     order.review = newReview;
   } else {
     (order as any).sellerReview = newReview;
   }
-  saveOrdersToDisk();
+  postgresStore.saveOrders(orders);
 
   // Dynamically update target user's rating and reviewsCount using public reviews
   recalculateUserRating(resolvedTargetUserId);
+
+  createNotification({
+    userId: resolvedTargetUserId,
+    type: 'review',
+    title: 'New Review Received',
+    message: `${caller.name} left a ${numRating}-star review for order "${order.title}".`,
+    link: `/messages/${order.id}`,
+    dedupKey: `review_${newReview.id}`,
+    actorId: caller.id
+  });
 
   // Broadcast system message to workstream
   const sysMsg: Message = {
@@ -4917,7 +4488,7 @@ app.post('/api/reviews', requireAuth, (req, res) => {
     }
   };
   recordMessage(sysMsg);
-  saveMessagesToDisk();
+  postgresStore.saveMessages(messages);
   broadcastMessage(sysMsg, order.id);
 
   res.status(201).json({ success: true, review: newReview, order: enrichOrderWithServiceInfo(order) });
@@ -4950,7 +4521,7 @@ app.put('/api/reviews/:id', requireAuth, (req, res) => {
   }
 
   review.updatedAt = new Date().toISOString();
-  saveReviewsToDisk();
+  postgresStore.saveReviews(reviews);
 
   if (review.targetUserId) {
     recalculateUserRating(review.targetUserId);
@@ -4961,7 +4532,7 @@ app.put('/api/reviews/:id', requireAuth, (req, res) => {
     if (order && order.review && order.review.id === review.id) {
       order.review.rating = review.rating;
       order.review.comment = review.comment;
-      saveOrdersToDisk();
+      postgresStore.saveOrders(orders);
     }
   }
 
@@ -5000,7 +4571,7 @@ app.post('/api/reviews/:id/reply', requireAuth, (req, res) => {
   };
 
   review.reply = replyObj;
-  saveReviewsToDisk();
+  postgresStore.saveReviews(reviews);
 
   if (review.orderId) {
     const order = orderIndex.get(review.orderId);
@@ -5008,7 +4579,7 @@ app.post('/api/reviews/:id/reply', requireAuth, (req, res) => {
       if (order.review && order.review.id === review.id) {
         order.review.reply = replyObj;
       }
-      saveOrdersToDisk();
+      postgresStore.saveOrders(orders);
 
       const sysMsg: Message = {
         id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
@@ -5021,7 +4592,7 @@ app.post('/api/reviews/:id/reply', requireAuth, (req, res) => {
         metadata: { action: 'review_reply_submitted', reply: replyObj }
       };
       recordMessage(sysMsg);
-      saveMessagesToDisk();
+      postgresStore.saveMessages(messages);
       broadcastMessage(sysMsg, order.id);
     }
   }
@@ -5046,9 +4617,39 @@ app.get('/api/audit-logs', requireRole(['admin', 'super_admin']), (req, res) => 
 // User Email Notifications API
 app.get('/api/user-emails/:userId', requireAuth, (req, res) => {
   const caller = (req as any).authenticatedUser;
-  const isAdminOrStaff = caller.role === 'admin' || caller.role === 'super_admin' || caller.role === 'support';
-  if (caller.id !== req.params.userId && !isAdminOrStaff) return res.status(403).json({ error: 'Forbidden' });
-  const userList = userEmails.filter(e => e.userId === req.params.userId);
+  const targetUser = users.find(u => u.id === req.params.userId);
+  if (!targetUser) return res.status(404).json({ error: 'User not found' });
+
+  const isSelf = caller.id === req.params.userId;
+  const isSuperAdmin = caller.role === 'super_admin';
+  const isAdmin = caller.role === 'admin';
+  const isSupport = caller.role === 'support';
+  const isTargetAdmin = targetUser.role === 'admin' || targetUser.role === 'super_admin';
+
+  // CRITICAL PRIVILEGE ESCALATION FIX:
+  // Support staff CANNOT inspect any administrator or super_admin emails (prevents escalation)!
+  // Regular admins cannot inspect super_admin emails.
+  if (!isSelf) {
+    if (isSupport && isTargetAdmin) {
+      return res.status(403).json({ error: 'Forbidden: Support staff cannot inspect administrator emails.' });
+    }
+    if (isAdmin && targetUser.role === 'super_admin') {
+      return res.status(403).json({ error: 'Forbidden: Only super_admin can inspect super_admin emails.' });
+    }
+    if (!isAdmin && !isSuperAdmin && !isSupport) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient privileges.' });
+    }
+  }
+
+  // Redact any 6-digit verification codes from body or snippet in user-emails
+  const userList = userEmails
+    .filter(e => e.userId === req.params.userId)
+    .map(e => ({
+      ...e,
+      snippet: e.snippet ? e.snippet.replace(/\b\d{6}\b/g, '******') : '',
+      body: e.body ? e.body.replace(/\b\d{6}\b/g, '******') : ''
+    }));
+
   res.json(userList);
 });
 
@@ -5056,6 +4657,7 @@ app.patch('/api/user-emails/:id/read', requireAuth, (req, res) => {
   const em = userEmails.find(e => e.id === req.params.id);
   if (!em) return res.status(404).json({ error: 'Notification not found' });
   em.read = true;
+  postgresStore.saveUserEmails(userEmails).catch(err => console.error('[PostgresStore] Failed to save user emails:', err));
   res.json({ success: true });
 });
 
@@ -5082,6 +4684,7 @@ app.post('/api/support-tickets', requireAuth, (req, res) => {
     ]
   };
   supportTickets.unshift(newTicket);
+  postgresStore.saveSupportTickets(supportTickets).catch(err => console.error('[PostgresStore] Failed to save tickets:', err));
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -5102,7 +4705,6 @@ if (!fs.existsSync(WORKSTREAM_UPLOADS_DIR)) {
 }
 
 const WORKSTREAM_FILE_URL_PREFIX = '/api/workstream/files/';
-const WORKSTREAM_UPLOAD_INDEX_FILE = path.join(DATA_DIR, 'workstream_uploads.json');
 const WORKSTREAM_MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB
 const WORKSTREAM_ABANDONED_UPLOAD_TTL_MS = 24 * 3600 * 1000;
 // Allowed attachment types. Vectors (.svg) and code (.html, .js, .ts, etc.) are fully supported without restriction.
@@ -5116,17 +4718,11 @@ const WORKSTREAM_ALLOWED_EXTENSIONS = new Set([
 // .html is deliberately NOT inline: it would run uploaded scripts on the app origin. It is still fully downloadable.
 const WORKSTREAM_INLINE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.pdf', '.svg', '.txt']);
 
+
 // Upload ownership index: filename -> who uploaded it and when. Persisted so access rules and
 // abandoned-upload cleanup survive restarts.
-interface WorkstreamUploadRecord { ownerId: string; createdAt: string; }
-let workstreamUploadIndex: Record<string, WorkstreamUploadRecord> = {};
-try {
-  if (fs.existsSync(WORKSTREAM_UPLOAD_INDEX_FILE)) {
-    workstreamUploadIndex = JSON.parse(fs.readFileSync(WORKSTREAM_UPLOAD_INDEX_FILE, 'utf-8')) || {};
-  }
-} catch (err) {
-  console.error('Failed to load workstream upload index:', err);
-}
+// (Old implementation removed in favor of atomic helper)
+
 
 // (Old implementation removed in favor of atomic helper)
 
@@ -5233,6 +4829,7 @@ function cleanupAbandonedWorkstreamUploads() {
 
     try { fs.unlinkSync(path.join(WORKSTREAM_UPLOADS_DIR, filename)); } catch { /* already gone */ }
     delete workstreamUploadIndex[filename];
+    postgresStore.deleteUploadRecord(filename).catch(console.error);
     changed = true;
   }
 
@@ -5336,7 +4933,7 @@ export function processAutoAcceptOrders(customNow?: number): Array<{
 
       // Record acceptedVersion
       order.acceptedVersion = latestDelivery.version;
-      saveOrdersToDisk();
+      postgresStore.saveOrders(orders);
 
       // Post system message into workstream
       const sysMsg: Message = {
@@ -5354,7 +4951,7 @@ export function processAutoAcceptOrders(customNow?: number): Array<{
         }
       };
       recordMessage(sysMsg);
-      saveMessagesToDisk();
+      postgresStore.saveMessages(messages);
       broadcastMessage(sysMsg, order.id);
 
       // Log to the audit log
@@ -5402,7 +4999,7 @@ app.post('/api/admin/orders/check-auto-accept', requireAdmin, (req, res) => {
     res.status(500).json({ error: err.message || 'Auto-accept check failed' });
   }
 });
-app.post('/api/workstream/upload', requireAuth, rateLimit(5, 60_000), express.raw({ type: '*/*', limit: WORKSTREAM_MAX_UPLOAD_BYTES }), (req, res) => {
+app.post('/api/workstream/upload', requireAuth, rateLimit(5, 60_000), express.raw({ type: '*/*', limit: WORKSTREAM_MAX_UPLOAD_BYTES }), async (req, res) => {
   try {
     const caller = (req as any).authenticatedUser;
     const rawName = (req.query.name as string) || 'attachment';
@@ -5410,12 +5007,8 @@ app.post('/api/workstream/upload', requireAuth, rateLimit(5, 60_000), express.ra
     try { decodedName = decodeURIComponent(rawName); } catch { decodedName = rawName; }
     const safeBase = path.basename(decodedName).replace(/[^a-zA-Z0-9._-]/g, '_') || 'file';
     const ext = path.extname(safeBase).toLowerCase();
-    if (ext && !WORKSTREAM_ALLOWED_EXTENSIONS.has(ext)) {
-      WORKSTREAM_ALLOWED_EXTENSIONS.add(ext);
-    }
     const nameWithoutExt = path.basename(safeBase, path.extname(safeBase));
     const storedFilename = `${Date.now()}_${randomUUID().slice(0, 8)}_${nameWithoutExt}${ext}`;
-    const filePath = path.join(WORKSTREAM_UPLOADS_DIR, storedFilename);
 
     const buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
     if (!buffer || buffer.length === 0) {
@@ -5425,8 +5018,16 @@ app.post('/api/workstream/upload', requireAuth, rateLimit(5, 60_000), express.ra
       return res.status(413).json({ error: 'File is too large (25 MB maximum).' });
     }
 
-    fs.writeFileSync(filePath, buffer);
-    workstreamUploadIndex[storedFilename] = { ownerId: caller.id, createdAt: new Date().toISOString() };
+    const mimeType = (req.headers['content-type'] as string) || 'application/octet-stream';
+    const fileUrl = await uploadFileToCloudStorage(storedFilename, buffer, mimeType);
+
+    workstreamUploadIndex[storedFilename] = {
+      ownerId: caller.id,
+      originalName: safeBase,
+      mime: mimeType,
+      size: buffer.length,
+      createdAt: new Date().toISOString()
+    };
     saveWorkstreamUploadIndex();
 
     const bytes = buffer.length;
@@ -5434,12 +5035,10 @@ app.post('/api/workstream/upload', requireAuth, rateLimit(5, 60_000), express.ra
       ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
       : `${Math.max(1, Math.round(bytes / 1024))} KB`;
 
-    const mimeType = (req.headers['content-type'] as string) || 'application/octet-stream';
-
     res.json({
       name: safeBase,
       size: sizeStr,
-      url: `${WORKSTREAM_FILE_URL_PREFIX}${storedFilename}`,
+      url: fileUrl,
       type: mimeType
     });
   } catch (err: any) {
@@ -5512,8 +5111,20 @@ app.post('/api/messages', requireAuth, (req, res) => {
     const newMsg = sanitizeAndCreateMessage(caller, order, req.body, fileCheck);
 
     recordMessage(newMsg);
-    saveMessagesToDisk();
+    postgresStore.saveMessages(messages);
     broadcastMessage(newMsg, order.id);
+
+    const otherUserId = order.buyerId === caller.id ? order.sellerId : order.buyerId;
+    createNotification({
+      userId: otherUserId,
+      type: 'message',
+      title: 'New Message',
+      message: `${caller.name} sent a message regarding order "${order.title}".`,
+      link: `/messages/${order.id}`,
+      dedupKey: `msg_${newMsg.id}`,
+      actorId: caller.id
+    });
+
     res.json(newMsg);
   } catch (err: any) {
     res.status(400).json({ error: err.message || 'Failed to send message' });
@@ -5572,7 +5183,7 @@ app.get('/api/admin/messages/threads', requireAdmin, (req, res) => {
   res.json(threads);
 });
 
-app.post('/api/gigs', requireAuth, (req, res) => {
+app.post('/api/gigs', requireAuth, async (req, res) => {
   const authUserId = (req as any).authenticatedUserId;
   const caller = (req as any).authenticatedUser || users.find(u => u.id === authUserId);
   if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
@@ -5615,10 +5226,18 @@ app.post('/api/gigs', requireAuth, (req, res) => {
     extras: req.body.extras || []
   };
   gigs.unshift(newGig);
+  try {
+    await postgresStore.saveGigs(gigs);
+  } catch (err) {
+    console.error('[CreateGig] Failed to persist:', err);
+    const idx = gigs.findIndex(g => g.id === newGig.id);
+    if (idx !== -1) gigs.splice(idx, 1);
+    return res.status(500).json({ error: 'Could not save. Please try again.' });
+  }
   res.json(newGig);
 });
 
-app.post('/api/projects', requireAuth, (req, res) => {
+app.post('/api/projects', requireAuth, async (req, res) => {
   const authUserId = (req as any).authenticatedUserId;
   const caller = (req as any).authenticatedUser || users.find(u => u.id === authUserId);
   if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
@@ -5651,7 +5270,14 @@ app.post('/api/projects', requireAuth, (req, res) => {
     featured: false
   };
   projects.unshift(newProj);
-  saveProjectsToDisk();
+  try {
+    await postgresStore.saveProjects(projects);
+  } catch (err) {
+    console.error('[CreateProject] Failed to persist:', err);
+    const idx = projects.findIndex(p => p.id === newProj.id);
+    if (idx !== -1) projects.splice(idx, 1);
+    return res.status(500).json({ error: 'Could not save. Please try again.' });
+  }
   res.json(newProj);
 });
 
@@ -5675,7 +5301,7 @@ app.patch('/api/projects/:id/status', requireAuth, (req, res) => {
 
   const oldStatus = p.status;
   p.status = requestedStatus as Project['status'];
-  saveProjectsToDisk();
+  postgresStore.saveProjects(projects);
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -5711,12 +5337,12 @@ app.patch('/api/admin/projects/:id', requireAdmin, (req, res) => {
   if (req.body.moderationStatus !== undefined) p.moderationStatus = req.body.moderationStatus;
   if (req.body.moderationNotes !== undefined) p.moderationNotes = req.body.moderationNotes;
 
-  saveProjectsToDisk();
+  postgresStore.saveProjects(projects);
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: 'PROJECT_EDITED',
     target: `Project "${p.title}"`,
     details: `Updated project parameters, category, budget, or moderation status`,
@@ -5732,12 +5358,12 @@ app.patch('/api/admin/projects/:id/status', requireAdmin, (req, res) => {
 
   const oldStatus = p.status;
   p.status = req.body.status;
-  saveProjectsToDisk();
+  postgresStore.saveProjects(projects);
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: `PROJECT_STATUS_${req.body.status.toUpperCase()}`,
     target: `Project "${p.title}"`,
     details: `Changed project status from "${oldStatus}" to "${req.body.status}"`,
@@ -5752,12 +5378,12 @@ app.patch('/api/admin/projects/:id/feature', requireAdmin, (req, res) => {
   if (!p) return res.status(404).json({ error: 'Project not found' });
 
   p.featured = !p.featured;
-  saveProjectsToDisk();
+  postgresStore.saveProjects(projects);
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: p.featured ? 'PROJECT_FEATURED' : 'PROJECT_UNFEATURED',
     target: `Project "${p.title}"`,
     details: `${p.featured ? 'Featured' : 'Unfeatured'} project on platform homepage & listings`,
@@ -5773,12 +5399,12 @@ app.delete('/api/admin/projects/:id', requireAdmin, (req, res) => {
 
   const deleted = projects[index];
   projects.splice(index, 1);
-  saveProjectsToDisk();
+  postgresStore.saveProjects(projects);
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: 'PROJECT_DELETED',
     target: `Project "${deleted.title}"`,
     details: `Permanently removed project #${deleted.id} by ${deleted.buyerName}`,
@@ -5808,10 +5434,12 @@ app.patch('/api/admin/gigs/:id', requireAdmin, (req, res) => {
   if (req.body.moderationStatus !== undefined) g.moderationStatus = req.body.moderationStatus;
   if (req.body.moderationNotes !== undefined) g.moderationNotes = req.body.moderationNotes;
 
+  saveGigsToPostgres();
+
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: 'GIG_EDITED',
     target: `Gig "${g.title}"`,
     details: `Updated gig specifications, pricing, delivery, or moderation verdict: "${g.moderationStatus || 'none'}"`,
@@ -5827,11 +5455,12 @@ app.patch('/api/admin/gigs/:id/status', requireAdmin, (req, res) => {
 
   const oldStatus = g.status;
   g.status = req.body.status;
+  saveGigsToPostgres();
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: `GIG_STATUS_${req.body.status.toUpperCase()}`,
     target: `Gig "${g.title}"`,
     details: `Changed service status from "${oldStatus}" to "${req.body.status}"`,
@@ -5846,11 +5475,12 @@ app.patch('/api/admin/gigs/:id/feature', requireAdmin, (req, res) => {
   if (!g) return res.status(404).json({ error: 'Gig/Service not found' });
 
   g.featured = !g.featured;
+  saveGigsToPostgres();
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: g.featured ? 'GIG_FEATURED' : 'GIG_UNFEATURED',
     target: `Gig "${g.title}"`,
     details: `${g.featured ? 'Featured' : 'Unfeatured'} freelancer service on marketplace home & listings`,
@@ -5866,11 +5496,12 @@ app.delete('/api/admin/gigs/:id', requireAdmin, (req, res) => {
 
   const deleted = gigs[index];
   gigs.splice(index, 1);
+  saveGigsToPostgres();
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: 'GIG_DELETED',
     target: `Gig "${deleted.title}"`,
     details: `Permanently deleted freelancer gig #${deleted.id} by ${deleted.freelancerName}`,
@@ -5891,6 +5522,7 @@ app.delete('/api/gigs/:id', requireAuth, (req, res) => {
   }
 
   gigs.splice(index, 1);
+  saveGigsToPostgres();
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -5932,18 +5564,46 @@ app.patch('/api/gigs/:id', requireAuth, (req, res) => {
     g.price = newPrice;
   }
   if (req.body.deliveryDays !== undefined) g.deliveryDays = Number(req.body.deliveryDays);
-  if (req.body.status !== undefined) g.status = req.body.status;
-  if (req.body.featured !== undefined) g.featured = Boolean(req.body.featured);
-  if (req.body.moderationStatus !== undefined) g.moderationStatus = req.body.moderationStatus;
-  if (req.body.moderationNotes !== undefined) g.moderationNotes = req.body.moderationNotes;
+  if (req.body.extras !== undefined && Array.isArray(req.body.extras)) g.extras = req.body.extras;
+  if (req.body.image !== undefined && typeof req.body.image === 'string') g.image = req.body.image;
+
+  // CRITICAL SECURITY FIX: Sellers CANNOT modify moderationStatus, moderationNotes, featured, or featuredUntil
+  // These fields are strictly ignored and reserved for admin moderation or the paid /feature endpoint
+  delete req.body.moderationStatus;
+  delete req.body.moderationNotes;
+  delete req.body.featured;
+  delete req.body.featuredUntil;
+
+  // Sellers can only set status to 'published', 'paused', or 'draft'
+  if (req.body.status !== undefined) {
+    const requestedStatus = String(req.body.status).toLowerCase().trim();
+    if (!['published', 'paused', 'draft'].includes(requestedStatus)) {
+      return res.status(400).json({ error: 'Invalid status. Sellers can only set status to published, paused, or draft.' });
+    }
+
+    // A rejected or flagged gig CANNOT be approved or published by the seller
+    if (requestedStatus === 'published' && (g.moderationStatus === 'rejected' || g.moderationStatus === 'flagged')) {
+      return res.status(400).json({ error: 'This gig has been rejected or flagged by moderators and cannot be published until reviewed and approved by an administrator.' });
+    }
+
+    const activeSettings = siteSettings.getSettings();
+    if (requestedStatus === 'published' && activeSettings.marketplace?.gigModerationRequired && g.moderationStatus !== 'approved') {
+      g.status = 'pending';
+      g.moderationStatus = 'pending';
+    } else {
+      g.status = requestedStatus as any;
+    }
+  }
+
+  saveGigsToPostgres();
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Freelancer / User',
-    role: 'freelancer',
+    actor: caller.name,
+    role: caller.role,
     action: 'GIG_UPDATED',
     target: `Gig "${g.title}"`,
-    details: `Updated gig details/status to "${g.status}"`,
+    details: `Updated gig details/status to "${g.status}" (moderation: ${g.moderationStatus || 'approved'})`,
     timestamp: new Date().toLocaleString()
   });
 
@@ -5958,15 +5618,46 @@ app.patch('/api/gigs/:id/feature', requireAuth, (req, res) => {
     return res.status(403).json({ error: 'Forbidden: You can only feature your own gigs.' });
   }
 
-  g.featured = !g.featured;
+  // Check if actively featured
+  if (g.featured && g.featuredUntil && new Date(g.featuredUntil) > new Date()) {
+    return res.status(400).json({ error: 'Gig is already actively featured.' });
+  }
+
+  const activeSettings = siteSettings.getSettings();
+  const fee = activeSettings.marketplace.featuredGigFee;
+  if (!fee || fee <= 0) {
+    return res.status(500).json({ error: 'Feature fee is not configured.' });
+  }
+
+  // Charge fee via ledger
+  const idempotencyKey = `feat_${g.id}_${Date.now()}`;
+  try {
+    financeLedger.postJournal({
+      reference: `Featured Gig: ${g.id}`,
+      description: `Feature fee for gig: ${g.title}`,
+      eventType: 'ADMIN_ADJUSTMENT_DEBIT',
+      idempotencyKey,
+      actor: caller.name,
+      entries: [
+        { accountCode: '2020', accountName: 'Freelancer Wallets Payable', debit: fee, credit: 0, currency: 'USD', description: 'Feature fee', userId: caller.id },
+        { accountCode: '4010', accountName: 'Marketplace Platform Commission Fee', debit: 0, credit: fee, currency: 'USD', description: `Featured gig revenue: ${g.title}` }
+      ]
+    });
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  g.featured = true;
+  g.featuredUntil = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  saveGigsToPostgres();
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Freelancer / User',
+    actor: caller.name,
     role: 'freelancer',
-    action: g.featured ? 'GIG_FEATURED' : 'GIG_UNFEATURED',
+    action: 'GIG_FEATURED',
     target: `Gig "${g.title}"`,
-    details: `${g.featured ? 'Featured' : 'Unfeatured'} gig on marketplace listings`,
+    details: `Featured gig for 7 days. Fee: $${fee}`,
     timestamp: new Date().toLocaleString()
   });
 
@@ -6007,8 +5698,19 @@ app.post('/api/proposals', requireAuth, (req, res) => {
   };
   proposals.unshift(newProp);
   proj.proposalsCount += 1;
-  saveProjectsToDisk();
-  saveProposalsToDisk();
+  postgresStore.saveProjects(projects);
+  postgresStore.saveProposals(proposals);
+
+  createNotification({
+    userId: proj.buyerId,
+    type: 'proposal',
+    title: 'New Proposal Received',
+    message: `${caller.name} submitted a $${bidAmount} proposal for your project "${proj.title}".`,
+    link: `/projects/${proj.id}`,
+    dedupKey: `proposal_${newProp.id}`,
+    actorId: caller.id
+  });
+
   res.json(newProp);
 });
 
@@ -6107,11 +5809,11 @@ async function processProposalAccept(req: any, res: any) {
       createdAt: new Date().toISOString()
     };
     workstreamOffers.push(offer);
-    await saveOffersToDisk();
+    await postgresStore.saveOffers(workstreamOffers);
     
     // Register order in memory for message attachment
     recordOrder(order);
-    await saveOrdersToDisk(); // CRASH SAFE POINT: Order IS ACTUALLY on disk as 'payment_pending' before funding
+    await postgresStore.saveOrders(orders); // CRASH SAFE POINT: Order IS ACTUALLY on disk as 'payment_pending' before funding
     emitSystemEvent(order.id, 'order_created', `Order placed: ${order.title}. Payment is held in escrow until the work is approved.`);
     postOfferMessage(order, offer, null, `Proposal ${offer.number} was created.`, 'offer_created');
 
@@ -6128,7 +5830,7 @@ async function processProposalAccept(req: any, res: any) {
       
       // Update order status to funded only AFTER ledger successfully records the escrow
       order.status = 'funded_in_escrow';
-      await saveOrdersToDisk();
+      await postgresStore.saveOrders(orders);
     } catch (fundingErr: any) {
       // Rollback memory and disk state if funding fails (e.g. insufficient wallet balance)
       const orderIdx = orders.findIndex(o => o.id === order.id);
@@ -6137,6 +5839,7 @@ async function processProposalAccept(req: any, res: any) {
 
       const offerIdx = workstreamOffers.findIndex(o => o.id === offer.id);
       if (offerIdx !== -1) workstreamOffers.splice(offerIdx, 1);
+      postgresStore.saveOffers(workstreamOffers).catch(err => console.error('[OfferRollback] Failed to persist:', err));
 
       for (let i = messages.length - 1; i >= 0; i--) {
         if (messages[i].orderId === order.id) {
@@ -6152,10 +5855,10 @@ async function processProposalAccept(req: any, res: any) {
         workspaceService.deleteWorkspace(workspace.workspaceId);
       }
 
-      await saveOrdersToDisk();
-      await saveOffersToDisk();
-      await saveProposalsToDisk();
-      await saveMessagesToDisk();
+      await postgresStore.saveOrders(orders);
+      await postgresStore.saveOffers(workstreamOffers);
+      await postgresStore.saveProposals(proposals);
+      await postgresStore.saveMessages(messages);
 
       return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for proposal.' });
     }
@@ -6163,14 +5866,14 @@ async function processProposalAccept(req: any, res: any) {
     proposal.status = 'accepted';
     proposal.workstreamOrderId = order.id;
     proposal.offerId = offer.id;
-    await saveProposalsToDisk();
+    await postgresStore.saveProposals(proposals);
     
     syncUserBalances();
 
     offer.status = 'accepted';
     offer.resolvedAt = new Date().toISOString();
     offer.resolvedBy = caller.id;
-    await saveOffersToDisk();
+    await postgresStore.saveOffers(workstreamOffers);
     
     postOfferMessage(order, offer, null, `Proposal ${offer.number} was accepted and escrow funded ($${order.amount}).`, 'offer_accepted');
 
@@ -6196,7 +5899,7 @@ async function processProposalDecline(req: any, res: any) {
     if (proposal.status !== 'pending') return res.status(409).json({ error: `Proposal is already ${proposal.status}.` });
 
     proposal.status = 'rejected';
-    await saveProposalsToDisk();
+    await postgresStore.saveProposals(proposals);
 
     // If an offer existed, mark it as declined
     const offer = workstreamOffers.find(of => of.proposalId === proposal.id || of.id === proposal.offerId);
@@ -6204,7 +5907,7 @@ async function processProposalDecline(req: any, res: any) {
       offer.status = 'declined';
       offer.resolvedAt = new Date().toISOString();
       offer.resolvedBy = caller.id;
-      await saveOffersToDisk();
+      await postgresStore.saveOffers(workstreamOffers);
       const order = orders.find(o => o.id === offer.orderId);
       if (order) {
         postOfferMessage(order, offer, null, `${offer.number} was declined by the buyer.`, 'offer_declined');
@@ -6331,7 +6034,7 @@ app.post('/api/orders', requireAuth, rateLimit(30, 60_000), async (req, res) => 
     }
     const enriched = enrichOrderWithServiceInfo(newOrd);
     recordOrder(enriched);
-    await saveOrdersToDisk(); // CRASH SAFE POINT: Order recorded as 'payment_pending' before funding
+    await postgresStore.saveOrders(orders); // CRASH SAFE POINT: Order recorded as 'payment_pending' before funding
 
     if (!isInquiry) {
       try {
@@ -6339,7 +6042,7 @@ app.post('/api/orders', requireAuth, rateLimit(30, 60_000), async (req, res) => 
         
         // Update order status to funded only AFTER ledger successfully records the escrow
         enriched.status = 'funded_in_escrow';
-        await saveOrdersToDisk();
+        await postgresStore.saveOrders(orders);
         
         syncUserBalances();
       } catch (fundingErr: any) {
@@ -6354,8 +6057,8 @@ app.post('/api/orders', requireAuth, rateLimit(30, 60_000), async (req, res) => 
           }
         }
 
-        await saveOrdersToDisk();
-        await saveMessagesToDisk();
+        await postgresStore.saveOrders(orders);
+        await postgresStore.saveMessages(messages);
 
         // Cleanup orphaned workspace if this was the only order in it
         const wsId = (enriched as any).workspaceId;
@@ -6384,7 +6087,7 @@ app.post('/api/orders', requireAuth, rateLimit(30, 60_000), async (req, res) => 
           timestamp: new Date(Date.now() + 1).toISOString(),
           metadata: { action: 'requirements_logged' }
         } as Message);
-        await saveMessagesToDisk();
+        await postgresStore.saveMessages(messages);
       }
     }
     res.status(201).json(enriched);
@@ -6397,38 +6100,10 @@ app.post('/api/orders', requireAuth, rateLimit(30, 60_000), async (req, res) => 
 // WORKSTREAM OFFERS (proposal / invoice / deposit request)
 // Real records with a status. Money only moves through financeLedger.fundEscrow when the BUYER accepts.
 // ==========================================
-type WorkstreamOfferKind = 'proposal' | 'invoice' | 'deposit';
-type WorkstreamOfferStatus = 'pending' | 'accepted' | 'paid' | 'declined' | 'cancelled';
-interface WorkstreamOffer {
-  id: string;
-  number: string;
-  orderId: string;
-  proposalId?: string;
-  kind: WorkstreamOfferKind;
-  title: string;
-  amount: number;
-  deliveryDays?: number;
-  note?: string;
-  files?: Array<{ id?: string; name: string; size: string; url: string; uploadedAt?: string }>;
-  reference?: string;
-  status: WorkstreamOfferStatus;
-  createdBy: string;
-  createdAt: string;
-  resolvedAt?: string;
-  resolvedBy?: string;
-}
 
-const OFFERS_FILE = path.join(DATA_DIR, 'workstream_offers.json');
-let workstreamOffers: WorkstreamOffer[] = [];
-try {
-  if (fs.existsSync(OFFERS_FILE)) {
-    const parsed = JSON.parse(fs.readFileSync(OFFERS_FILE, 'utf-8'));
-    if (Array.isArray(parsed)) workstreamOffers = parsed;
-  }
-} catch (e) {
-  console.error('Failed to load workstream offers:', e);
+function saveOffersToDisk() { 
+  postgresStore.saveOffers(workstreamOffers).catch(err => console.error('[PostgresStore] Failed to save offers:', err)); 
 }
-function saveOffersToDisk() { writeJsonAtomic(OFFERS_FILE, workstreamOffers); }
 
 const OFFER_LABEL: Record<WorkstreamOfferKind, string> = { proposal: 'proposal', invoice: 'invoice', deposit: 'deposit request' };
 const OFFER_PREFIX: Record<WorkstreamOfferKind, string> = { proposal: 'PRP', invoice: 'INV', deposit: 'DEP' };
@@ -6501,8 +6176,28 @@ function postOfferMessage(order: Order, offer: WorkstreamOffer, sender: { id: st
   };
   // recordMessage (not a bare push) so the message is also in messageIndex, which GET /api/messages/:orderId reads.
   recordMessage(msg);
-  saveMessagesToDisk();
+  postgresStore.saveMessages(messages);
   broadcastMessage(msg, order.id);
+
+  const recipientIds: string[] = [];
+  if (sender?.id) {
+    const other = sender.id === order.buyerId ? order.sellerId : order.buyerId;
+    if (other) recipientIds.push(other);
+  } else {
+    if (order.buyerId) recipientIds.push(order.buyerId);
+    if (order.sellerId && order.sellerId !== order.buyerId) recipientIds.push(order.sellerId);
+  }
+  for (const userId of recipientIds) {
+    createNotification({
+      userId,
+      type: 'offer',
+      title: 'New Offer Activity',
+      message: text,
+      link: `/messages/${order.id}`,
+      dedupKey: `offer_${action}_${msg.id}`,
+      actorId: sender?.id
+    });
+  }
 }
 
 function offerCaller(req: Request) {
@@ -6626,7 +6321,7 @@ app.post('/api/orders/:id/offers', requireAuth, rateLimit(20, 60_000), (req, res
       createdAt: new Date().toISOString()
     };
     workstreamOffers.push(offer);
-    saveOffersToDisk();
+    postgresStore.saveOffers(workstreamOffers);
 
     // When a seller raises an invoice with deliverables/notes/deliverWork from the WorkStream UI, record the delivery and mark as delivered
     if (kind === 'invoice' && (req.body?.deliverWork || note || uploadedFiles.length > 0 || rawRef)) {
@@ -6650,7 +6345,7 @@ app.post('/api/orders/:id/offers', requireAuth, rateLimit(20, 60_000), (req, res
           if (rev.status === 'requested') rev.status = 'resolved';
         }
       }
-      saveOrdersToDisk();
+      postgresStore.saveOrders(orders);
     }
 
     postOfferMessage(order, offer, { id: caller.id, name: caller.name }, `New ${OFFER_LABEL[kind]} ${offer.number}: ${title}`, 'offer_created');
@@ -6693,17 +6388,17 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
         const linkedProp = findLinkedProposalForOffer(offer, order);
         if (linkedProp && linkedProp.status === 'pending') {
           linkedProp.status = 'rejected';
-          await saveProposalsToDisk();
+          await postgresStore.saveProposals(proposals);
         }
       }
       if (offer.kind === 'invoice' && (order.status === 'delivered' || order.status === 'draft_review')) {
         const otherPendingInvoice = workstreamOffers.some(o => o.orderId === order.id && o.id !== offer.id && o.kind === 'invoice' && o.status === 'pending');
         if (!otherPendingInvoice && orderHasEscrow(order.id)) {
           order.status = 'in_progress';
-          await saveOrdersToDisk();
+          await postgresStore.saveOrders(orders);
         }
       }
-      await saveOffersToDisk();
+      await postgresStore.saveOffers(workstreamOffers);
       postOfferMessage(order, offer, null, `${offer.number} was cancelled by the seller.`, 'offer_cancelled');
       return res.json({ offer: viewOffer(offer), order: enrichOrderWithServiceInfo(order) });
     }
@@ -6724,16 +6419,16 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
         const linkedProp = findLinkedProposalForOffer(offer, order);
         if (linkedProp) {
           linkedProp.status = 'rejected';
-          await saveProposalsToDisk();
+          await postgresStore.saveProposals(proposals);
         }
       } else if (offer.kind === 'invoice' && (order.status === 'delivered' || order.status === 'draft_review')) {
         const otherPendingInvoice = workstreamOffers.some(o => o.orderId === order.id && o.id !== offer.id && o.kind === 'invoice' && o.status === 'pending');
         if (!otherPendingInvoice && orderHasEscrow(order.id)) {
           order.status = 'revision';
-          saveOrdersToDisk();
+          postgresStore.saveOrders(orders);
         }
       }
-      await saveOffersToDisk();
+      await postgresStore.saveOffers(workstreamOffers);
       postOfferMessage(order, offer, null, `${offer.number} was declined by the buyer.`, 'offer_declined');
       return res.json({ offer: viewOffer(offer), order: enrichOrderWithServiceInfo(order) });
     }
@@ -6797,9 +6492,9 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
       offer.resolvedBy = caller.id;
 
       syncUserBalances();
-      await saveOffersToDisk();
-      await saveOrdersToDisk();
-      await saveMessagesToDisk();
+      await postgresStore.saveOffers(workstreamOffers);
+      await postgresStore.saveOrders(orders);
+      await postgresStore.saveMessages(messages);
       const completionNote = additionalAmount > 0
         ? `${offer.number} ($${invoiceAmount.toLocaleString()}) was paid (+$${additionalAmount.toLocaleString()} funded from wallet) and full escrow ($${invoiceAmount.toLocaleString()}) was released to the seller. Order completed!`
         : `${offer.number} was accepted and escrow funds ($${invoiceAmount.toLocaleString()}) were released to the seller. Order completed!`;
@@ -6818,7 +6513,7 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
       const prevStatus = order.status;
       order.previousStatus = prevStatus;
       order.status = 'payment_pending';
-      await saveOrdersToDisk(); // CRASH SAFE POINT: Order is durable as payment_pending before ledger funding
+      await postgresStore.saveOrders(orders); // CRASH SAFE POINT: Order is durable as payment_pending before ledger funding
 
       try {
         fundOrderEscrowWithEvent({ orderId: order.id, orderTitle: newTitle, amount: offer.amount, buyerId: order.buyerId, sellerId: order.sellerId, actor: `user:${order.buyerId}` });
@@ -6840,14 +6535,14 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
             linkedProp.workstreamOrderId = order.id;
             linkedProp.offerId = offer.id;
             order.proposalId = linkedProp.id;
-            await saveProposalsToDisk();
+            await postgresStore.saveProposals(proposals);
           }
         }
-        await saveOrdersToDisk();
+        await postgresStore.saveOrders(orders);
         postOfferMessage(order, offer, null, `${offer.number} was accepted and escrow was funded ($${offer.amount}).`, 'offer_accepted');
       } catch (fundingErr: any) {
         order.status = prevStatus;
-        await saveOrdersToDisk();
+        await postgresStore.saveOrders(orders);
         return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for offer.' });
       }
     } else if (isFollowOnAfterCompletion) {
@@ -6884,7 +6579,7 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
       // 1. Record & save order FIRST so it exists in memory / index for system event attachment
       const enrichedOrder = enrichOrderWithServiceInfo(newOrder);
       recordOrder(enrichedOrder);
-      await saveOrdersToDisk(); // CRASH SAFE POINT: Order recorded as 'payment_pending' before funding
+      await postgresStore.saveOrders(orders); // CRASH SAFE POINT: Order recorded as 'payment_pending' before funding
       emitSystemEvent(newOrder.id, 'order_created', `Order placed: ${newOrder.title}. Payment is held in escrow until the work is approved.`);
 
       // 2. Fund escrow with rollback on failure
@@ -6900,7 +6595,7 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
         
         // Update order status to funded only AFTER ledger successfully records the escrow
         enrichedOrder.status = 'funded_in_escrow';
-        await saveOrdersToDisk();
+        await postgresStore.saveOrders(orders);
         
         syncUserBalances();
       } catch (fundingErr: any) {
@@ -6915,8 +6610,8 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
           }
         }
 
-        await saveOrdersToDisk();
-        await saveMessagesToDisk();
+        await postgresStore.saveOrders(orders);
+        await postgresStore.saveMessages(messages);
         return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for follow-on order.' });
       }
 
@@ -6947,7 +6642,7 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
           linkedProp.status = 'accepted';
           linkedProp.workstreamOrderId = order.id;
           linkedProp.offerId = offer.id;
-          await saveProposalsToDisk();
+          await postgresStore.saveProposals(proposals);
         }
       }
       postOfferMessage(order, offer, null, `${offer.number} was accepted and escrow was topped up with $${offer.amount}. All funds and milestones remain unified under Order #${order.id}.`, 'offer_accepted');
@@ -6955,8 +6650,8 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
 
     offer.resolvedAt = now; offer.resolvedBy = caller.id;
     syncUserBalances();
-    await saveOrdersToDisk();
-    await saveOffersToDisk();
+    await postgresStore.saveOrders(orders);
+    await postgresStore.saveOffers(workstreamOffers);
     res.json({ offer: viewOffer(offer), order: enrichOrderWithServiceInfo(order) });
   } catch (err: any) {
     // fundEscrow throws on insufficient balance, frozen wallets, below-minimum amounts, etc. Nothing was changed.
@@ -6983,14 +6678,14 @@ app.patch('/api/admin/proposals/:id', requireAdmin, async (req, res) => {
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: 'PROPOSAL_EDITED',
     target: `Proposal #${p.id}`,
     details: `Updated bid parameters ($${p.bidAmount}), delivery days (${p.deliveryDays}d), or status (${p.status}) for freelancer ${p.freelancerName}`,
     timestamp: new Date().toLocaleString()
   });
-  await saveProposalsToDisk();
+  await postgresStore.saveProposals(proposals);
   res.json(p);
 });
 
@@ -7003,15 +6698,15 @@ app.patch('/api/admin/proposals/:id/status', requireAdmin, async (req, res) => {
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: `PROPOSAL_STATUS_${req.body.status.toUpperCase()}`,
     target: `Proposal #${p.id}`,
     details: `Changed proposal status from "${oldStatus}" to "${req.body.status}" for freelancer ${p.freelancerName}`,
     timestamp: new Date().toLocaleString()
   });
 
-  await saveProposalsToDisk();
+  await postgresStore.saveProposals(proposals);
   res.json(p);
 });
 
@@ -7026,14 +6721,14 @@ app.delete('/api/admin/proposals/:id', requireAdmin, async (req, res) => {
   const proj = projects.find(p => p.id === deleted.projectId);
   if (proj && proj.proposalsCount > 0) {
     proj.proposalsCount -= 1;
-    await saveProjectsToDisk();
+    await postgresStore.saveProjects(projects);
   }
-  await saveProposalsToDisk();
+  await postgresStore.saveProposals(proposals);
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: adminActor(req),
+    role: (req as any).authenticatedUser?.role || 'admin',
     action: 'PROPOSAL_DELETED',
     target: `Proposal #${deleted.id}`,
     details: `Permanently removed proposal #${deleted.id} by freelancer ${deleted.freelancerName} from project #${deleted.projectId}`,
@@ -7047,64 +6742,97 @@ app.delete('/api/admin/proposals/:id', requireAdmin, async (req, res) => {
 app.patch('/api/admin/users/:id', requireAdmin, (req, res) => {
   const u = users.find(user => user.id === req.params.id);
   if (!u) return res.status(404).json({ error: 'User not found' });
-  
-  if (req.body.name !== undefined) u.name = escapeHtml(String(req.body.name));
-  if (req.body.email !== undefined) u.email = escapeHtml(String(req.body.email));
+  const caller = (req as any).authenticatedUser;
+
+  // CRITICAL GUARDRAIL: Only super_admin can edit a super_admin account!
+  if (u.role === 'super_admin' && caller?.role !== 'super_admin') {
+    return res.status(403).json({ error: 'Forbidden: Regular administrators cannot modify a super_admin account.' });
+  }
+
+  // CRITICAL GUARDRAIL: Only super_admin can change or promote user roles!
   if (req.body.role !== undefined) {
-    const caller = (req as any).authenticatedUser;
-    if (req.body.role === 'super_admin' && caller?.role !== 'super_admin') {
-      return res.status(403).json({ error: 'Forbidden: Only super_admin can set super_admin role.' });
+    if (caller?.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Forbidden: Only super_admin can modify or assign roles.' });
     }
-    if (!['buyer', 'freelancer', 'admin', 'super_admin', 'support', 'moderator'].includes(req.body.role)) {
-      return res.status(400).json({ error: 'Invalid role.' });
+    const ALLOWED_ROLES = ['buyer', 'freelancer', 'admin', 'super_admin', 'support', 'moderator'];
+    if (!ALLOWED_ROLES.includes(req.body.role)) {
+      return res.status(400).json({ error: `Invalid role. Allowed roles: ${ALLOWED_ROLES.join(', ')}` });
     }
     u.role = req.body.role;
   }
+
+  // CRITICAL GUARDRAIL: Only super_admin can edit another admin's email or identity
+  if (req.body.email !== undefined) {
+    if (u.role === 'admin' && caller?.role !== 'super_admin' && caller?.id !== u.id) {
+      return res.status(403).json({ error: 'Forbidden: Only super_admin can change another administrator’s email.' });
+    }
+    u.email = escapeHtml(String(req.body.email));
+  }
+
+  if (req.body.name !== undefined) u.name = escapeHtml(String(req.body.name));
   if (req.body.title !== undefined) u.title = escapeHtml(String(req.body.title));
   if (req.body.bio !== undefined) u.bio = escapeHtml(String(req.body.bio));
   if (req.body.skills !== undefined) u.skills = Array.isArray(req.body.skills) ? req.body.skills : req.body.skills.split(',').map((s: string) => s.trim()).filter(Boolean);
   if (req.body.hourlyRate !== undefined) {
-      const hr = Number(req.body.hourlyRate);
-      if (!Number.isFinite(hr) || hr < 0) return res.status(400).json({ error: 'Invalid hourly rate.' });
-      u.hourlyRate = hr;
+    const hr = Number(req.body.hourlyRate);
+    if (!Number.isFinite(hr) || hr < 0) return res.status(400).json({ error: 'Invalid hourly rate.' });
+    u.hourlyRate = hr;
   }
-  // walletBalance is ledger-controlled and intentionally ignored here (use /api/admin/finance/adjustments)
   if (req.body.verified !== undefined) u.verified = Boolean(req.body.verified);
+
   if (req.body.status !== undefined) {
-      if (!['active', 'frozen', 'restricted'].includes(req.body.status)) {
-         return res.status(400).json({ error: 'Invalid status.' });
-      }
-      u.status = req.body.status;
+    const ALLOWED_STATUSES = ['active', 'frozen', 'restricted', 'suspended', 'deactivated'];
+    const newStatus = String(req.body.status).toLowerCase().trim();
+    if (!ALLOWED_STATUSES.includes(newStatus)) {
+      return res.status(400).json({ error: `Invalid status. Allowed statuses: ${ALLOWED_STATUSES.join(', ')}` });
+    }
+    if (u.role === 'super_admin' && caller?.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Forbidden: Only super_admin can change a super_admin status.' });
+    }
+    u.status = newStatus as any;
   }
 
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: caller?.name || adminActor(req),
+    role: caller?.role || 'admin',
     action: 'USER_PROFILE_EDITED',
     target: `User ${u.name}`,
     details: `Updated profile details and parameters for ${u.email}`,
     timestamp: new Date().toLocaleString()
   });
 
+  saveUsersToPostgres();
   res.json(safeUser(u));
 });
 
 app.patch('/api/admin/users/:id/status', requireAdmin, (req, res) => {
   const u = users.find(user => user.id === req.params.id);
   if (!u) return res.status(404).json({ error: 'User not found' });
-  
-  const oldStatus = u.status;
-  u.status = req.body.status;
-
   const admin = (req as any).authenticatedUser;
+
+  // CRITICAL GUARDRAIL: Validate status against strict allowed set
+  const ALLOWED_STATUSES = ['active', 'frozen', 'restricted', 'suspended', 'deactivated'];
+  const newStatus = String(req.body?.status || '').toLowerCase().trim();
+  if (!newStatus || !ALLOWED_STATUSES.includes(newStatus)) {
+    return res.status(400).json({ error: `Invalid status. Allowed statuses: ${ALLOWED_STATUSES.join(', ')}` });
+  }
+
+  // CRITICAL GUARDRAIL: Only super_admin can change super_admin status
+  if (u.role === 'super_admin' && admin?.role !== 'super_admin') {
+    return res.status(403).json({ error: 'Forbidden: Only a super_admin can change a super_admin account status.' });
+  }
+
+  const oldStatus = u.status;
+  u.status = newStatus as any;
+
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: admin?.name || 'Admin',
+    actor: admin?.name || adminActor(req),
     role: admin?.role || 'admin',
-    action: `USER_STATUS_${req.body.status.toUpperCase()}`,
+    action: `USER_STATUS_${newStatus.toUpperCase()}`,
     target: `User ${u.name}`,
-    details: `Changed account status from ${oldStatus} to ${req.body.status}`,
+    details: `Changed account status from ${oldStatus} to ${newStatus}`,
     timestamp: new Date().toLocaleString()
   });
 
@@ -7118,10 +6846,11 @@ app.patch('/api/admin/users/:id/status', requireAdmin, (req, res) => {
   }
 
   // Notify user via chat message and email notification if suspended, restricted, or deactivated
-  if (req.body.status === 'suspended' || req.body.status === 'restricted' || req.body.status === 'deactivated') {
-    notifyUserOnAdminAction(u, req.body.status, req.body.notes);
+  if (newStatus === 'suspended' || newStatus === 'restricted' || newStatus === 'deactivated') {
+    notifyUserOnAdminAction(u, newStatus, req.body.notes);
   }
 
+  saveUsersToPostgres();
   res.json(safeUser(u));
 });
 
@@ -7180,6 +6909,7 @@ app.patch('/api/admin/users/:id/verify', requireAdmin, (req, res) => {
     timestamp: new Date().toLocaleString()
   });
 
+  saveUsersToPostgres();
   res.json(safeUser(u));
 });
 
@@ -7201,9 +6931,16 @@ app.delete('/api/admin/users/:id', requireAdmin, (req, res) => {
   users.splice(index, 1);
 
   // Clean up listings to maintain references
-  gigs = gigs.filter(g => g.freelancerId !== req.params.id);
-  projects = projects.filter(p => p.buyerId !== req.params.id);
-  saveProjectsToDisk();
+  const remainingGigs = gigs.filter(g => g.freelancerId !== req.params.id);
+  gigs.length = 0;
+  gigs.push(...remainingGigs);
+  const remainingProjects = projects.filter(p => p.buyerId !== req.params.id);
+  projects.length = 0;
+  projects.push(...remainingProjects);
+  postgresStore.saveProjects(projects);
+
+  saveUsersToPostgres();
+  saveGigsToPostgres();
 
   const admin = (req as any).authenticatedUser;
   registerAuditLog({
@@ -7267,7 +7004,7 @@ app.patch('/api/admin/disputes/:id/resolve', requireAdmin, (req, res) => {
         metadata: { action: 'dispute_resolved', status, notes }
       };
       recordMessage(sysMsg);
-      saveMessagesToDisk();
+      postgresStore.saveMessages(messages);
       broadcastMessage(sysMsg, order.id);
     }
     registerAuditLog({
@@ -7279,9 +7016,9 @@ app.patch('/api/admin/disputes/:id/resolve', requireAdmin, (req, res) => {
       details: `Resolved dispute with status ${status}. Notes: ${notes}`,
       timestamp: new Date().toLocaleString()
     });
-    saveDisputesToDisk();
-    saveOrdersToDisk();
-    saveRefundsToDisk();
+    postgresStore.saveDisputes(disputes);
+    postgresStore.saveOrders(orders);
+    postgresStore.saveRefunds(refunds);
     res.json(d);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -7300,6 +7037,7 @@ app.post('/api/admin/tickets/:id/reply', requireAdmin, (req, res) => {
     timestamp: new Date().toISOString()
   });
   t.status = 'in_progress';
+  postgresStore.saveSupportTickets(supportTickets).catch(err => console.error('[PostgresStore] Failed to save tickets:', err));
   res.json(t);
 });
 
@@ -7331,6 +7069,36 @@ function broadcastMessage(message: Message, orderId: string) {
   }
 }
 
+  function notifyOrderParties(orderId: string, action: string, text: string, msgId: string) {
+    const order = orders.find(o => o.id === orderId);
+    if (!order) return;
+    const map: Record<string, { to: ('buyer'|'seller')[]; title: string }> = {
+      order_created:        { to: ['seller'],           title: 'New Order Received' },
+      escrow_funded:        { to: ['seller'],           title: 'Order Funded' },
+      deliverable_approved: { to: ['seller'],           title: 'Delivery Approved' },
+      revision_requested:   { to: ['seller'],           title: 'Revision Requested' },
+      revision_resolved:    { to: ['buyer'],            title: 'Revision Delivered' },
+      escrow_released:      { to: ['seller'],           title: 'Payment Released' },
+      escrow_refunded:      { to: ['buyer'],            title: 'Refund Issued' },
+      order_completed:      { to: ['buyer', 'seller'],  title: 'Order Completed' },
+      dispute_opened:       { to: ['buyer', 'seller'],  title: 'Dispute Opened' },
+      dispute_resolved:     { to: ['buyer', 'seller'],  title: 'Dispute Resolved' },
+    };
+    const rule = map[action];
+    if (!rule) return;
+    for (const who of rule.to) {
+      const userId = who === 'buyer' ? order.buyerId : order.sellerId;
+      createNotification({
+        userId,
+        type: 'order',
+        title: rule.title,
+        message: text,
+        link: `/messages/${orderId}`,
+        dedupKey: `${action}_${msgId}_${userId}`
+      });
+    }
+  }
+
 function emitSystemEvent(orderId: string, action: string, text: string, metadata: Record<string, any> = {}) {
   const sysMsg: Message = {
     id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
@@ -7343,8 +7111,9 @@ function emitSystemEvent(orderId: string, action: string, text: string, metadata
     metadata: { ...metadata, action }
   };
   recordMessage(sysMsg);
-  saveMessagesToDisk();
+  postgresStore.saveMessages(messages);
   broadcastMessage(sysMsg, orderId);
+  notifyOrderParties(orderId, action, text, sysMsg.id);
 }
 
 function disconnectUserSockets(userId: string, reason = 'Session invalidated') {
@@ -7354,6 +7123,84 @@ function disconnectUserSockets(userId: string, reason = 'Session invalidated') {
     }
   }
 }
+
+export function broadcastNotificationToUser(userId: string, notification: Notification) {
+  for (const client of clients) {
+    if ((client as any).isAuthenticated && (client as any).authenticatedUserId === userId && client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(JSON.stringify({ type: 'NOTIFICATION', notification }));
+      } catch {}
+    }
+  }
+}
+
+export async function createNotification({
+  userId,
+  type,
+  title,
+  message,
+  link,
+  dedupKey,
+  actorId
+}: {
+  userId: string;
+  type: string;
+  title: string;
+  message: string;
+  link?: string;
+  dedupKey?: string;
+  actorId?: string;
+}) {
+  if (actorId && actorId === userId) return;
+  if (!userId) return;
+
+  if (dedupKey) {
+    const existing = notifications.find(n => n.userId === userId && n.dedupKey === dedupKey);
+    if (existing) return;
+  }
+
+  const newNotif: Notification = {
+    id: `notif_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+    userId,
+    type,
+    title,
+    message,
+    link: link || '#',
+    read: false,
+    createdAt: new Date().toISOString(),
+    dedupKey: dedupKey || undefined
+  };
+
+  notifications.unshift(newNotif);
+  await postgresStore.saveNotification(newNotif).catch(err => console.error('[PostgresStore] Failed to save notification:', err));
+  broadcastNotificationToUser(userId, newNotif);
+}
+
+app.get('/api/notifications', requireAuth, (req, res) => {
+  const userId = (req as any).user.id;
+  const userNotifs = notifications.filter(n => n.userId === userId);
+  res.json(userNotifs);
+});
+
+app.post('/api/notifications/:id/read', requireAuth, (req, res) => {
+  const userId = (req as any).user.id;
+  const notifId = req.params.id;
+  const notif = notifications.find(n => n.id === notifId && n.userId === userId);
+  if (notif) {
+    notif.read = true;
+    postgresStore.markNotificationRead(notifId, userId).catch(err => console.error('[PostgresStore] Failed to mark notification read:', err));
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/notifications/read-all', requireAuth, (req, res) => {
+  const userId = (req as any).user.id;
+  notifications.forEach(n => {
+    if (n.userId === userId) n.read = true;
+  });
+  postgresStore.markAllNotificationsRead(userId).catch(err => console.error('[PostgresStore] Failed to mark all notifications read:', err));
+  res.json({ success: true });
+});
 
 const clients = new Set<WebSocket>();
 
@@ -7365,7 +7212,7 @@ wss.on('connection', (ws, req) => {
     // Set a timeout to authenticate. If no valid AUTHENTICATE message is received within 1 second, close.
     const authTimeout = setTimeout(() => {
       if (!(ws as any).isAuthenticated) {
-        try { ws.close(4401, 'Authentication timeout'); } catch {}
+        try { ws.close(1008, 'Authentication timeout'); } catch {}
       }
     }, 1000);
 
@@ -7423,7 +7270,7 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout: NodeJS.Timeout) {
         authAttempts++;
         if (authAttempts > 3) {
           ws.send(JSON.stringify({ error: 'Too many authentication attempts' }));
-          try { ws.close(4401, 'Too many auth attempts'); } catch {}
+          try { ws.close(1008, 'Too many auth attempts'); } catch {}
           return;
         }
 
@@ -7452,7 +7299,7 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout: NodeJS.Timeout) {
         }
         
         ws.send(JSON.stringify({ error: 'Invalid token' }));
-        try { ws.close(4401, 'Authentication failed'); } catch {}
+        try { ws.close(1008, 'Authentication failed'); } catch {}
         return;
       }
 
@@ -7465,7 +7312,7 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout: NodeJS.Timeout) {
       // Validate session version and status
       const currentDbUser = users.find(u => u.id === (ws as any).authenticatedUserId);
       if (!currentDbUser || currentDbUser.status !== 'active' || (currentDbUser.sessionVersion !== undefined && (ws as any).sessionVersion !== undefined && currentDbUser.sessionVersion !== (ws as any).sessionVersion)) {
-        try { ws.close(4401, 'Session invalidated or account inactive'); } catch {}
+        try { ws.close(1008, 'Session invalidated or account inactive'); } catch {}
         return;
       }
 
@@ -7509,11 +7356,22 @@ app.get('/sitemap.xml', (_req, res) => {
 
 // SSR and Vite integration
 (async () => {
+  try {
+    await hydrateStoreFromPostgres();
+  } catch (err) {
+    console.error('[FATAL] Postgres hydration failed; refusing to start:', err);
+    process.exit(1);
+  }
   await setupSSR(app, IS_PROD, __dirname, () => ({ gigs, users, projects, categories }));
 
   const portArgIndex = process.argv.findIndex(arg => arg === '--port' || arg === '-p');
   const cliPort = portArgIndex !== -1 && process.argv[portArgIndex + 1] ? Number(process.argv[portArgIndex + 1]) : null;
   const PORT = cliPort || (process.env.PORT && process.env.PORT !== '8080' ? Number(process.env.PORT) : 3000);
+
+  process.on('unhandledRejection', (reason) => {
+    console.error('[UnhandledRejection]', reason);
+  });
+
   if (!server.listening) {
     server.on('error', (err: any) => {
       if (err.code === 'EADDRINUSE') {
@@ -7534,7 +7392,7 @@ app.get('/sitemap.xml', (_req, res) => {
 // Graceful shutdown
 async function gracefulShutdown(signal: string) {
   console.log(`Received ${signal}. Flushing pending writes...`);
-  await Promise.all(writeQueue.values());
+  await postgresStore.flushAll();
   process.exit(0);
 }
 
